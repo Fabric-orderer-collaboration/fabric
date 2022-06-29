@@ -35,8 +35,7 @@ jobs:
 
       # Runs a single command using the runners shell
       - name: Unit Tests
-        run: go test orderer/...
+        run: go test ./orderer/...
 
       - name: Integration Tests
-        working-directory: /home/runner/go/src/github.com/hyperledger/fabric
-        run: ginkgo -v integration/raft
+        run: ginkgo -v ./integration/raft
