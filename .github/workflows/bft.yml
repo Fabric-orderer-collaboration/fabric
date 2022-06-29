@@ -28,8 +28,7 @@ jobs:
           go-version: 1.18
 
       - name: Prepare Env
-        - run: go install -mod=mod github.com/onsi/ginkgo/v2/ginkgo
-        - run: go get github.com/onsi/gomega/...
+        run: go install -mod=mod github.com/onsi/ginkgo/v2/ginkgo && go get github.com/onsi/gomega/...
 
       # Runs a single command using the runners shell
       - name: Unit Tests
