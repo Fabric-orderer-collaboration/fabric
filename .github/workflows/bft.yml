@@ -30,9 +30,11 @@ jobs:
       - name: Prepare Env
         run: go install -mod=mod github.com/onsi/ginkgo/v2/ginkgo && go get github.com/onsi/gomega/...
 
+      - name: test
+        run: ls && pwd
+
       # Runs a single command using the runners shell
       - name: Unit Tests
-        working-directory: /home/runner/go/src/github.com/hyperledger/fabric
         run: go test orderer/...
 
       - name: Integration Tests
