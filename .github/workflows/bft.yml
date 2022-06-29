@@ -27,11 +27,11 @@ jobs:
         with:
           go-version: 1.18
 
-      - name: Prepare Env
+      - name: Install Pre-reqs
         run: go install -mod=mod github.com/onsi/ginkgo/v2/ginkgo && go get github.com/onsi/gomega/...
 
-      - name: test
-        run: ls && pwd
+      - name: Vendor
+        run: go mod vendor
 
       # Runs a single command using the runners shell
       - name: Unit Tests
