@@ -38,4 +38,4 @@ jobs:
       #  run: go test ./orderer/...
 
       - name: Integration Tests
-        run: cd integration/raft && ginkgo -v  --keep-going --slow-spec-threshold 60s .
+        run: bash ./scripts/run-integration-tests.sh integration/raft
