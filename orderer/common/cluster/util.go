@@ -568,6 +568,109 @@ func globalEndpointsFromConfig(aggregatedTLSCerts [][]byte, bundle *channelconfi
 	return globalEndpoints
 }
 
+type BlockVerifierFunc func(header *common.BlockHeader, metadata *common.BlockMetadata) error
+
+func BlockVerifierBuilder(bccsp bccsp.BCCSP) func(block *common.Block) BlockVerifierFunc {
+	return func(block *common.Block) BlockVerifierFunc {
+		bundle, failed := bundleFromConfigBlock(block, bccsp)
+		if failed != nil {
+			return failed
+		}
+
+		policy, exists := bundle.PolicyManager().GetPolicy(policies.BlockValidation)
+		if !exists {
+			return invalidConfigBlockInit
+		}
+
+		bftEnabled := bundle.ChannelConfig().Capabilities().ConsensusTypeBFT()
+		_ = bftEnabled
+
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			if len(metadata.Metadata) < int(common.BlockMetadataIndex_SIGNATURES)+1 {
+				return errors.Errorf("no signatures in block metadata")
+			}
+
+			md := &common.Metadata{}
+			if err := proto.Unmarshal(block.Metadata.Metadata[common.BlockMetadataIndex_SIGNATURES], md); err != nil {
+				return errors.Wrapf(err, "error unmarshalling signatures from metadata: %v", err)
+			}
+
+			var signatureSet []*protoutil.SignedData
+			for _, metadataSignature := range md.Signatures {
+				signatureHeader, err := protoutil.UnmarshalSignatureHeader(metadataSignature.SignatureHeader)
+				if err != nil {
+					return fmt.Errorf("failed unmarshalling signature header for block %d: %v", block.Header.Number, err)
+				}
+
+				signedPayload := util.ConcatenateBytes(md.Value, metadataSignature.SignatureHeader, protoutil.BlockHeaderBytes(block.Header))
+
+				signerIdentity := signatureHeader.Creator
+
+				// TODO: Here we check if the consenter expects us to fetch its identity by its numeric identifier, we can enable this once we introduce referencing by identifiers
+				/*				if bftEnabled && len(signerIdentity) == 0 {
+								identifier := signatureHeader.NotYetIntroducedFieldThatIsTheConsentersIdentifier
+								identifier := uint64(1)
+								signerIdentity = searchConsenterIdentityByID(bundle, identifier)
+								if len(signerIdentity) == 0 {
+									// The identifier is not within the consenter set
+									continue
+								}
+							}*/
+
+				signatureSet = append(
+					signatureSet,
+					&protoutil.SignedData{
+						Identity:  signerIdentity,
+						Data:      signedPayload,
+						Signature: metadataSignature.Signature,
+					},
+				)
+			}
+
+			return policy.EvaluateSignedData(signatureSet)
+		}
+
+	}
+}
+
+func searchConsenterIdentityByID(bundle *channelconfig.Bundle, identifier uint64) []byte {
+	for _, consenter := range bundle.ChannelConfig().Orderers() {
+		if consenter.Id == identifier {
+			return protoutil.MarshalOrPanic(&msp.SerializedIdentity{
+				Mspid:   consenter.MspId,
+				IdBytes: consenter.Identity,
+			})
+		}
+	}
+	return nil
+}
+
+func bundleFromConfigBlock(block *common.Block, bccsp bccsp.BCCSP) (*channelconfig.Bundle, BlockVerifierFunc) {
+	if block.Data == nil || len(block.Data.Data) == 0 {
+		return nil, invalidConfigBlockInit
+	}
+
+	env := &common.Envelope{}
+	if err := proto.Unmarshal(block.Data.Data[0], env); err != nil {
+		return nil, invalidConfigBlockInit
+	}
+
+	bundle, err := channelconfig.NewBundleFromEnvelope(env, bccsp)
+	if err != nil {
+		return nil, invalidConfigBlockInit
+	}
+
+	return bundle, nil
+}
+
+var (
+	ErrInvalidConfigBlockInit = errors.Errorf("initialized with an invalid config block")
+)
+
+func invalidConfigBlockInit(_ *common.BlockHeader, _ *common.BlockMetadata) error {
+	return ErrInvalidConfigBlockInit
+}
+
 //go:generate mockery -dir . -name VerifierFactory -case underscore -output ./mocks/
 
 // VerifierFactory creates BlockVerifiers.
