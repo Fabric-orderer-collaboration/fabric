@@ -42,6 +42,7 @@ func nameFactory(name string, max int) func() string {
 }
 
 func TestBlockFetcherHappyPath(t *testing.T) {
+	t.Parallel()
 	bf := cluster.BlockFetcher{
 		FetcherConfig: cluster.FetcherConfig{
 			Endpoints: []cluster.EndpointCriteria{
@@ -57,8 +58,8 @@ func TestBlockFetcherHappyPath(t *testing.T) {
 		},
 		TimeNow: time.Now,
 		Logger:  flogging.MustGetLogger("test"),
-		BlockSourceFactory: func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.BlockSource {
-			return mock_block_puller(1, nil, time.Millisecond*1)
+		BlockSourceFactory: func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
+			return mock_block_puller(1, nil, time.Millisecond*1), nil
 		},
 		BlockVerifierFactory: func(block *common.Block) cluster.BlockVerifierFunc {
 			return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
@@ -74,10 +75,57 @@ func TestBlockFetcherHappyPath(t *testing.T) {
 	require.Equal(t, uint64(1), bf.PullBlock(1).Header.Number)
 }
 
+func TestBlockFetcherBlockSourceError(t *testing.T) {
+	// block source factory returns error and is not able to create a block source
+	// PullBlock should return nil
+	t.Parallel()
+	bf := cluster.BlockFetcher{
+		FetcherConfig: cluster.FetcherConfig{
+			Endpoints: []cluster.EndpointCriteria{
+				// add 2 endpoints to pull from
+				{Endpoint: "localhost:5100"},
+				{Endpoint: "localhost:5200"},
+			},
+			FetchTimeout:                 time.Duration(10 * time.Millisecond),
+			CensorshipSuspicionThreshold: time.Duration(5 * time.Millisecond),
+			// Disable shuffle timeout, shuffle interval is set to a large value to ensure no shuffling takes place
+			PeriodicalShuffleInterval: time.Duration(8 * time.Hour),
+			// Inject Time Function
+		},
+		TimeNow: time.Now,
+		Logger:  flogging.MustGetLogger("test"),
+		// blocksource factory should return error
+		BlockSourceFactory: func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
+			return mock_block_puller(1, nil, time.Millisecond*1), errors.New("bad config block")
+		},
+		BlockVerifierFactory: func(block *common.Block) cluster.BlockVerifierFunc {
+			return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+				// assuming blocks are valid
+				return nil
+			}
+		},
+	}
+
+	var blockSourceError error
+	bf.Logger = bf.Logger.WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
+		if strings.Contains(entry.Message, "Failed setting block source") {
+			blockSourceError = errors.New(entry.Message)
+		}
+		return nil
+	}))
+
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
+
+	// pullblock from any endpoint
+	require.Equal(t, (*common.Block)(nil), bf.PullBlock(1))
+	require.NotEqual(t, nil, blockSourceError)
+}
+
 func TestBlockFetcherShuffleTimeOut(t *testing.T) {
 	// node1 and node2 send blocks after 12s. Shuffle timeout is set to 12s ,so
 	// successive PullBlock calls to the block puller should fetch
 	// blocks from the different nodes, since the source would be shuffled after 12s
+	t.Parallel()
 	bf := cluster.BlockFetcher{
 		FetcherConfig: cluster.FetcherConfig{
 			Endpoints: []cluster.EndpointCriteria{
@@ -109,16 +157,16 @@ func TestBlockFetcherShuffleTimeOut(t *testing.T) {
 	// the block source created first sends blocks with data: "first"
 	// the block source created seond time sends blocks with data: "second"
 	// test uses this information to detetc whether blocksource has been shuffled while pulling blocks
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		// by default block fetcher will pull from Endpoint index 1 (not 0) for the first time
 		// i.e localhost:5200
 		bf.Logger.Infof("Block source get input %v", c.Endpoints)
 		if c.Endpoints[0].Endpoint == "localhost:5200" {
 			data := [][]byte{[]byte(getNameForSource())}
-			return mock_block_puller(1, data, time.Millisecond*12)
+			return mock_block_puller(1, data, time.Millisecond*12), nil
 		} else {
 			data := [][]byte{[]byte(getNameForSource())}
-			return mock_block_puller(1, data, time.Microsecond*1)
+			return mock_block_puller(1, data, time.Microsecond*1), nil
 		}
 	}
 
@@ -135,6 +183,7 @@ func TestBlockFetcherShuffleTimeOutDisable(t *testing.T) {
 	// node1 and node2 send blocks after 12s. Shuffle timeout is disabled so
 	// successive PullBlock calls to the block puller should fetch
 	// blocks from the same node.
+	t.Parallel()
 	bf := cluster.BlockFetcher{
 		FetcherConfig: cluster.FetcherConfig{
 			Endpoints: []cluster.EndpointCriteria{
@@ -156,13 +205,13 @@ func TestBlockFetcherShuffleTimeOutDisable(t *testing.T) {
 
 	getNameForSource := nameFactory("node", 3)
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		if c.Endpoints[0].Endpoint == "localhost:5100" {
 			data := [][]byte{[]byte(getNameForSource())}
-			return mock_block_puller(1, data, time.Millisecond*12)
+			return mock_block_puller(1, data, time.Millisecond*12), nil
 		} else {
 			data := [][]byte{[]byte(getNameForSource())}
-			return mock_block_puller(1, data, time.Millisecond*12)
+			return mock_block_puller(1, data, time.Millisecond*12), nil
 		}
 	}
 
@@ -187,6 +236,7 @@ func TestBlockFetcherShuffleTimeOutDisable(t *testing.T) {
 func TestBlockFetcherNodeOffline(t *testing.T) {
 	// node1 returns nil after 2s, so assuming it to be offline
 	// source should be shuffled and the block should be pulled from node2
+	t.Parallel()
 	bf := cluster.BlockFetcher{
 		FetcherConfig: cluster.FetcherConfig{
 			Endpoints: []cluster.EndpointCriteria{
@@ -210,12 +260,12 @@ func TestBlockFetcherNodeOffline(t *testing.T) {
 
 	getNameForSource := nameFactory("node", 3)
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		node_name := getNameForSource()
 		if node_name == "node1" {
-			return mock_block_puller_returns_nil(time.Millisecond * 2)
+			return mock_block_puller_returns_nil(time.Millisecond * 2), nil
 		} else {
-			return mock_block_puller(2, nil, time.Millisecond*1)
+			return mock_block_puller(2, nil, time.Millisecond*1), nil
 		}
 	}
 
@@ -228,9 +278,9 @@ func TestBlockFetcherNodeOffline(t *testing.T) {
 
 	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
 
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		// attestation source created withhold attestation
-		return mock_attestation_puller(1, time.Millisecond*1)
+		return mock_attestation_puller(1, time.Millisecond*1), nil
 	}
 
 	// set log level to debug for this test
@@ -297,34 +347,35 @@ func TestBlockFetcherBFTBehaviorBlockWithhold(t *testing.T) {
 	// The first endpoint we try to pull Blocks witholds blocks,
 	// the PullBlock should then suspect the endpoint and probe other endpoints to confirm the suspicion.
 	// then it should shuffle the endpoint and pull blocks from another endpoint, which should succeed.
+	t.Parallel()
 	bf := cluster.BlockFetcher{}
 
 	getNameForSource := nameFactory("node", 10)
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		// node1 witholds block while other endpoints can deliver blocks
 		node_name := getNameForSource()
 		if node_name == "node1" {
-			return mock_block_puller_returns_nil(time.Millisecond * 4)
+			return mock_block_puller_returns_nil(time.Millisecond * 4), nil
 		}
 		// the block puller below doesn't withold blocks
 		data := [][]byte{[]byte(node_name)}
 		// this block puller returns blocks with seq:1 and data after 2s
-		return mock_block_puller(1, data, time.Second*2)
+		return mock_block_puller(1, data, time.Second*2), nil
 	}
 
 	attestation_source_created := false
 	lock := sync.Mutex{}
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		lock.Lock()
 		defer lock.Unlock()
 		if !attestation_source_created {
 			// first attestation source created withholds attestation
 			attestation_source_created = true
-			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12)
+			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12), nil
 		}
 		// all other attestation pullers send atetstation blocks
-		return mock_attestation_puller(1, time.Second*2)
+		return mock_attestation_puller(1, time.Second*2), nil
 	}
 
 	// Add time
@@ -355,31 +406,101 @@ func TestBlockFetcherBFTBehaviorBlockWithhold(t *testing.T) {
 	require.Equal(t, uint64(1), block.Header.Number)
 }
 
+func TestBlockFetcherAttestationSourceError(t *testing.T) {
+	// The first endpoint we try to pull Blocks witholds blocks,
+	// the PullBlock should then suspect the endpoint and probe other endpoints to confirm the suspicion.
+	// But attestation source factory fails to create attestation sources, probing should fail and
+	// no block is pulled.
+	t.Parallel()
+	bf := cluster.BlockFetcher{}
+
+	getNameForSource := nameFactory("node", 10)
+
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
+		// node1 witholds block while other endpoints can deliver blocks
+		node_name := getNameForSource()
+		if node_name == "node1" {
+			return mock_block_puller_returns_nil(time.Millisecond * 4), nil
+		}
+		// the block puller below doesn't withold blocks
+		data := [][]byte{[]byte(node_name)}
+		// this block puller returns blocks with seq:1 and data after 2s
+		return mock_block_puller(1, data, time.Second*2), nil
+	}
+
+	attestation_source_created := false
+	lock := sync.Mutex{}
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
+		lock.Lock()
+		defer lock.Unlock()
+		if !attestation_source_created {
+			// first attestation source created withholds attestation
+			attestation_source_created = true
+			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12), nil
+		}
+		// all other attestation source fail to be created
+		return mock_attestation_puller(1, time.Second*2), errors.New("failed to pull attestations")
+	}
+
+	// Add time
+	bf.TimeNow = time.Now
+	bf.MaxRetries = 3
+	// Disable shuffle timeout
+	bf.CensorshipSuspicionThreshold = time.Duration(1 * time.Millisecond)
+	bf.PeriodicalShuffleInterval = time.Duration(1 * time.Hour)
+	bf.MaxByzantineNodes = 3
+	bf.Logger = flogging.MustGetLogger("test")
+	bf.FetcherConfig.FetchTimeout = time.Duration(time.Millisecond * 3)
+
+	bf.FetcherConfig.Endpoints = []cluster.EndpointCriteria{
+		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
+	}
+	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			// assuming blocks are valid
+			return nil
+		}
+	}
+
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
+	var attestationSourceError error
+	bf.Logger = bf.Logger.WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
+		if strings.Contains(entry.Message, "Failed to create attestation source") {
+			attestationSourceError = errors.New(entry.Message)
+		}
+		return nil
+	}))
+	block := bf.PullBlock(1)
+	require.Equal(t, (*common.Block)(nil), block)
+	require.NotEqual(t, nil, attestationSourceError)
+}
+
 func TestBlockFetcherBFTBehaviorSuspicionNoBlockWithhold(t *testing.T) {
 	// Endpoint node1 returns nil since the block may not be present
 	// PullBlock will try to probe other endpoints to suspect the endpoint localhost:5100 for witholding
 	// blocks but other endpoints will also return nil, So endpoint will not be shuffled and
 	// PullBlock should return nil after retries are enhausted.
+	t.Parallel()
 	bf := cluster.BlockFetcher{}
 
 	getNameForSource := nameFactory("node", 10)
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		// node1 witholds block while other endpoints can deliver blocks.
 
 		node_name := getNameForSource()
 		if node_name == "node1" {
-			return mock_block_puller_returns_nil(time.Millisecond * 12)
+			return mock_block_puller_returns_nil(time.Millisecond * 12), nil
 		}
 		// the block puller below doesn't withold blocks
 		data := [][]byte{[]byte(node_name)}
 		// this block puller returns blocks with seq:1 and data after 2s
-		return mock_block_puller(1, data, time.Millisecond*2)
+		return mock_block_puller(1, data, time.Millisecond*2), nil
 	}
 
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		// attestation source created withhold attestation
-		return mock_attestation_puller_returns_nil(nil, time.Second*1)
+		return mock_attestation_puller_returns_nil(nil, time.Second*1), nil
 	}
 
 	// Add time
@@ -441,6 +562,7 @@ func TestBlockFetcherBFTBehaviorSuspicionListFull(t *testing.T) {
 	// hence one entry (node1) should be evicted from suspect lists and source shuffled to pull from next orderer (node1),
 	// which is not byzantine now, since it is evicted from the suspect list, we should be able to pull from node1.
 	// Test is added for coverage of eviction from suspect list
+	t.Parallel()
 	bf := cluster.BlockFetcher{}
 
 	source_names := []string{"node1", "node2", "node1", "node3"}
@@ -452,28 +574,28 @@ func TestBlockFetcherBFTBehaviorSuspicionListFull(t *testing.T) {
 	}
 
 	firstTime := true
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		// node1 and node 2 withold block while other endpoints can deliver blocks
 		node_name := getNameForSource()
 		if (node_name == "node1" && firstTime) || node_name == "node2" {
 			firstTime = false
-			return mock_block_puller_returns_nil(time.Second * 4)
+			return mock_block_puller_returns_nil(time.Second * 4), nil
 		}
 		// the block puller below doesn't withold blocks
 		data := [][]byte{[]byte(node_name)}
 		// this block puller returns blocks with seq:1 and data after 2s
-		return mock_block_puller(1, data, time.Millisecond*2)
+		return mock_block_puller(1, data, time.Millisecond*2), nil
 	}
 
 	attestation_source_created := false
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		if !attestation_source_created {
 			// first attestation source created withholds attestation
 			attestation_source_created = true
-			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12)
+			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12), nil
 		}
 		// all other attestation pullers send atetstation blocks
-		return mock_attestation_puller(1, time.Microsecond*2)
+		return mock_attestation_puller(1, time.Microsecond*2), nil
 	}
 
 	// Add time
@@ -516,6 +638,7 @@ func TestBlockFetcherBFTBehaviorPullAttestationError(t *testing.T) {
 	// The first endpoint we try to pull Blocks witholds blocks,
 	// the PullBlock should then suspect the endpoint and probe other endpoints to confirm the suspicion.
 	// then it should shuffle the endpoint and pull blocks from another endpoint, which should succeed.
+	t.Parallel()
 	bf := cluster.BlockFetcher{}
 
 	source_names := []string{"node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8", "node9", "node10"}
@@ -526,32 +649,32 @@ func TestBlockFetcherBFTBehaviorPullAttestationError(t *testing.T) {
 		return name
 	}
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		// node1 witholds block while other endpoints can deliver blocks
 		node_name := getNameForSource()
 		if node_name == "node1" {
-			return mock_block_puller_returns_nil(time.Millisecond * 4)
+			return mock_block_puller_returns_nil(time.Millisecond * 4), nil
 		}
 		// the block puller below doesn't withold blocks
 		data := [][]byte{[]byte(node_name)}
 		// this block puller returns blocks with seq:1 and data after 2s
-		return mock_block_puller(1, data, time.Millisecond*2)
+		return mock_block_puller(1, data, time.Millisecond*2), nil
 	}
 
 	attestation_source_created := false
 	lock := sync.Mutex{}
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		lock.Lock()
 		defer lock.Unlock()
 		if !attestation_source_created {
 			bf.Logger.Infof("attestation source: connection failure")
 			// first attestation source created returns error
 			attestation_source_created = true
-			return mock_attestation_puller_returns_nil(errors.New("connection failure"), time.Millisecond*12)
+			return mock_attestation_puller_returns_nil(errors.New("connection failure"), time.Millisecond*12), nil
 		}
 		bf.Logger.Infof("attestaion source , all good")
 		// all other attestation pullers send atetstation blocks
-		return mock_attestation_puller(1, time.Millisecond*2)
+		return mock_attestation_puller(1, time.Millisecond*2), nil
 	}
 
 	bf.TimeNow = time.Now
@@ -604,6 +727,7 @@ func TestBlockFetcherMaxRetriesExhausted(t *testing.T) {
 	// Try to pull block from an orderer, it should withold blocks. while pulling attestations
 	// we don't suspect byzantine behaviour, so source is not shuffled and we try to pull from
 	// the same source again, it should try for MaxPullBlockRetries and then return a nil block.
+	t.Parallel()
 
 	bf := cluster.BlockFetcher{
 		FetcherConfig: cluster.FetcherConfig{
@@ -637,27 +761,27 @@ func TestBlockFetcherMaxRetriesExhausted(t *testing.T) {
 		return name
 	}
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		// by default block fetcher will pull from Endpoint index 1 (not 0) for the first time
 		// i.e localhost:5200
 		node_name := getNameForSource()
 		if node_name == "node1" {
-			return mock_block_puller_returns_nil(time.Millisecond * 12)
+			return mock_block_puller_returns_nil(time.Millisecond * 12), nil
 			// return mock_block_puller(1, data, time.Millisecond*12)
 		} else {
 			data := [][]byte{[]byte(getNameForSource())}
-			return mock_block_puller(1, data, time.Microsecond*1)
+			return mock_block_puller(1, data, time.Microsecond*1), nil
 		}
 	}
 
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		if c.Endpoints[0].Endpoint == "localhost:5100" || c.Endpoints[0].Endpoint == "localhost:5101" || c.Endpoints[0].Endpoint == "localhost:5102" || c.Endpoints[0].Endpoint == "localhost:5103" {
 			// withhold block
-			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12)
+			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12), nil
 		}
 
 		// all other attestation pullers send atetstation blocks
-		return mock_attestation_puller(1, time.Second*2)
+		return mock_attestation_puller(1, time.Second*2), nil
 	}
 
 	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
@@ -760,6 +884,7 @@ func TestAttestationPullerBasicHappyPath(t *testing.T) {
 	// set log level to debug for this test
 	// Scenario: Single ordering node,
 	// and the attestation puller pulls blocks 1
+	t.Parallel()
 	osn := newClusterNodeWithAttestationRPC(t)
 	defer osn.stop()
 
@@ -781,6 +906,7 @@ func TestAttestationPullerBasicHappyPath(t *testing.T) {
 func TestAttestationPullerPullAttestations(t *testing.T) {
 	// Scenario: 3 ordering nodes,
 	// and the attestation puller pulls attestaions for sequence number 5
+	t.Parallel()
 	osn1 := newClusterNodeWithAttestationRPC(t)
 	defer osn1.stop()
 
@@ -844,9 +970,7 @@ func TestAttestationPullerCloseWhenPullingInProgress(t *testing.T) {
 
 		<-cont
 		attestation, err := ap.PullAttestation(5)
-		fmt.Println(i, attestation, err)
 		if i == 0 {
-			fmt.Println("")
 			// orderer 1 is slow, attestation pulling should fail
 			require.Equal(t, true, err != nil)
 		} else {
@@ -865,6 +989,7 @@ func TestAttestationPullerCloseWhenPullingComplete(t *testing.T) {
 	// Scenario: 3 ordering nodes,
 	// and the attestation puller pulls attestaions for sequence number 5
 	// attestationpuller is Closed after pulling attestations
+	t.Parallel()
 
 	osn1 := newClusterNodeWithAttestationRPC(t)
 	// orderer node 1, is slow,  gives a response after 2 seconds
@@ -915,6 +1040,7 @@ func TestAttestationPullerPullAttestationsEmptyEndpoint(t *testing.T) {
 	// Scenario: 1 ordering node
 	// and the attestation puller tries to pulls attestaions
 	// when node address is not set in attestation puller
+	t.Parallel()
 
 	osn1 := newClusterNodeWithAttestationRPC(t)
 	defer osn1.stop()
@@ -959,6 +1085,7 @@ func newFailingCountingDialer() *failingDialer {
 }
 
 func TestAttestationPullerPullAttestationsDialFailure(t *testing.T) {
+	t.Parallel()
 	osn := newClusterNodeWithAttestationRPC(t)
 	defer osn.stop()
 
