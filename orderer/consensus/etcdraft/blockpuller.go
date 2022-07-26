@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/hyperledger/fabric-protos-go/common"
-	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/orderer/common/cluster"
@@ -148,75 +147,62 @@ func NewBlockFetcher(support consensus.ConsenterSupport,
 			string(stdDialer.Config.SecOpts.Certificate))
 	}
 
+	// TODO: change this to use the new mapping of consenters in the channel config
+
 	fc := cluster.FetcherConfig{
-		Channel:      support.ChannelID(),
-		Signer:       support,
-		TLSCert:      der.Bytes,
-		Dialer:       stdDialer,
-		Endpoints:    endpoints,
-		FetchTimeout: clusterConfig.ReplicationPullTimeout,
+		Channel:                      support.ChannelID(),
+		TLSCert:                      der.Bytes,
+		Endpoints:                    endpoints,
+		FetchTimeout:                 clusterConfig.ReplicationPullTimeout,
+		CensorshipSuspicionThreshold: time.Duration((int64(clusterConfig.ReplicationPullTimeout) * shuffleTimeoutPercentage / 100)),
+		PeriodicalShuffleInterval:    shuffleTimeoutMultiplier * clusterConfig.ReplicationPullTimeout,
+		MaxRetries:                   uint64(clusterConfig.ReplicationMaxRetries),
 	}
 
-	// To tolerate byzantine behaviour of `f` faulty nodes, we need a total of `3f + 1` nodes.
-	// f = maxByzantineNodes, total = len(endpoints)
-	maxByzantineNodes := uint64(len(endpoints)-1) / 3
+	bf_logger := flogging.MustGetLogger("orderer.common.cluster.puller").With("channel", support.ChannelID())
 
-	// timeout for time based shuffling
-	// 10 times the fetchtimeout
-	shuffleTimeout := shuffleTimeoutMultiplier * clusterConfig.ReplicationPullTimeout
-	shuffleTimeoutThrehold := shuffleTimeoutPercentage
+	lastConfigBlock, err := lastConfigBlockFromSupport(support)
+	if err != nil {
+		return nil, err
+	}
+
+	verifierFactory := cluster.BlockVerifierBuilder(bccsp)
 
 	bf := cluster.BlockFetcher{
-		MaxPullBlockRetries: 0,
-		AttestationSourceFactory: func(c cluster.FetcherConfig) cluster.AttestationSource {
+		FetcherConfig:        fc,
+		LastConfigBlock:      lastConfigBlock,
+		BlockVerifierFactory: verifierFactory,
+		VerifyBlock:          verifierFactory(lastConfigBlock),
+		AttestationSourceFactory: func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
+			fc, err := cluster.UpdateFetcherConfigFromConfigBlock(c, latestConfigBlock)
+			bf_logger.Errorf("Could not update FetcherConfig fom Config Block: %v", err)
 			return &cluster.AttestationPuller{
 				Config: fc,
-				Logger: flogging.MustGetLogger("orderer.common.cluster.attestationpuller").With("channel", support.ChannelID()),
-			}
+				Logger: flogging.MustGetLogger("orderer.common.cluster.attestationpuller").With("channel", fc.Channel),
+			}, err
 		},
-		BlockSourceFactory: func(c cluster.FetcherConfig) cluster.BlockSource {
+		BlockSourceFactory: func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
+			// update FetcherConfig from latestConfigBlock
+			fc, err := cluster.UpdateFetcherConfigFromConfigBlock(c, latestConfigBlock)
+			bf_logger.Errorf("Could not update FetcherConfig fom Config Block: %v", err)
 			return &cluster.BlockPuller{
 				VerifyBlockSequence: verifyBlockSequence,
-				Logger:              flogging.MustGetLogger("orderer.common.cluster.puller").With("channel", support.ChannelID()),
+				Logger:              flogging.MustGetLogger("orderer.common.cluster.puller").With("channel", fc.Channel),
 				RetryTimeout:        clusterConfig.ReplicationRetryTimeout,
 				MaxTotalBufferBytes: clusterConfig.ReplicationBufferSize,
 				FetchTimeout:        clusterConfig.ReplicationPullTimeout,
-				Endpoints:           c.Endpoints,
-				Signer:              c.Signer,
+				Endpoints:           fc.Endpoints,
+				Signer:              support,
 				TLSCert:             der.Bytes,
-				Channel:             c.Channel,
+				Channel:             fc.Channel,
 				Dialer:              stdDialer,
 				StopChannel:         make(chan struct{}),
-			}
+			}, err
 		},
-		Config:            fc,
-		Logger:            flogging.MustGetLogger("orderer.common.cluster.puller").With("channel", support.ChannelID()),
-		ShuffleTimeout:    shuffleTimeout,
-		LastShuffledAt:    time.Now(),
-		MaxByzantineNodes: maxByzantineNodes,
-		ConfirmByzantineBehavior: func(attestations []*orderer.BlockAttestation) bool {
-			if attestations == nil {
-				return true
-			}
-			isAttestationForged := func(a *orderer.BlockAttestation) bool {
-				err := verifyBlockSequence([]*common.Block{{Header: a.Header, Metadata: a.Metadata}}, support.ChannelID())
-				return err != nil
-			}
-			// the source is suspected for malicious behaviour if the attestations list has atleast one valid attestation
-			// check for the validity of each attestation, so that a forged attestation may not mislead us to suspect the source,
-			// i.e. funtcion should not return a false positive.
-			for _, a := range attestations {
-				if a != nil {
-					if isAttestationForged(a) {
-						continue
-					}
-					return true
-				}
-			}
-			return false
-		},
-		ShuffleTimeoutThrehold: shuffleTimeoutThrehold,
-		TimeNow:                time.Now,
+		Logger:  bf_logger,
+		Signer:  support,
+		Dialer:  stdDialer,
+		TimeNow: time.Now,
 	}
 
 	return &LedgerBlockPuller{

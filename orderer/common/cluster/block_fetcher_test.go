@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -31,140 +32,260 @@ import (
 	"google.golang.org/grpc/balancer/roundrobin"
 )
 
+// generates names like: node1, node2 etc on subsequent calls
+func nameFactory(name string, max int) func() string {
+	name_selector := 0
+	return func() string {
+		name_selector = (name_selector + 1) % max
+		return fmt.Sprintf("%s%d", name, name_selector)
+	}
+}
+
 func TestBlockFetcherHappyPath(t *testing.T) {
-	bf := cluster.BlockFetcher{}
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig) cluster.BlockSource {
-		return mock_block_puller(1, nil, time.Second*1)
+	t.Parallel()
+	bf := cluster.BlockFetcher{
+		FetcherConfig: cluster.FetcherConfig{
+			Endpoints: []cluster.EndpointCriteria{
+				// add 2 endpoints to pull from
+				{Endpoint: "localhost:5100"},
+				{Endpoint: "localhost:5200"},
+			},
+			FetchTimeout:                 time.Duration(10 * time.Millisecond),
+			CensorshipSuspicionThreshold: time.Duration(5 * time.Millisecond),
+			// Disable shuffle timeout, shuffle interval is set to a large value to ensure no shuffling takes place
+			PeriodicalShuffleInterval: time.Duration(8 * time.Hour),
+			// Inject Time Function
+		},
+		TimeNow: time.Now,
+		Logger:  flogging.MustGetLogger("test"),
+		BlockSourceFactory: func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
+			return mock_block_puller(1, nil, time.Millisecond*1), nil
+		},
+		BlockVerifierFactory: func(block *common.Block) cluster.BlockVerifierFunc {
+			return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+				// assuming blocks are valid
+				return nil
+			}
+		},
 	}
 
-	// Inject Time Function
-	bf.TimeNow = time.Now
-	bf.ShuffleTimeoutThrehold = 50
-	bf.ShuffleTimeout = time.Second * 1
-	bf.Logger = flogging.MustGetLogger("test")
-
-	// add 2 endpoints to pull from
-	bf.Config.Endpoints = []cluster.EndpointCriteria{{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5200"}}
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
 
 	// pullblock from any endpoint
 	require.Equal(t, uint64(1), bf.PullBlock(1).Header.Number)
+}
+
+func TestBlockFetcherBlockSourceError(t *testing.T) {
+	// block source factory returns error and is not able to create a block source
+	// PullBlock should return nil
+	t.Parallel()
+	bf := cluster.BlockFetcher{
+		FetcherConfig: cluster.FetcherConfig{
+			Endpoints: []cluster.EndpointCriteria{
+				// add 2 endpoints to pull from
+				{Endpoint: "localhost:5100"},
+				{Endpoint: "localhost:5200"},
+			},
+			FetchTimeout:                 time.Duration(10 * time.Millisecond),
+			CensorshipSuspicionThreshold: time.Duration(5 * time.Millisecond),
+			// Disable shuffle timeout, shuffle interval is set to a large value to ensure no shuffling takes place
+			PeriodicalShuffleInterval: time.Duration(8 * time.Hour),
+			// Inject Time Function
+		},
+		TimeNow: time.Now,
+		Logger:  flogging.MustGetLogger("test"),
+		// blocksource factory should return error
+		BlockSourceFactory: func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
+			return mock_block_puller(1, nil, time.Millisecond*1), errors.New("bad config block")
+		},
+		BlockVerifierFactory: func(block *common.Block) cluster.BlockVerifierFunc {
+			return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+				// assuming blocks are valid
+				return nil
+			}
+		},
+	}
+
+	var blockSourceError error
+	bf.Logger = bf.Logger.WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
+		if strings.Contains(entry.Message, "Failed setting block source") {
+			blockSourceError = errors.New(entry.Message)
+		}
+		return nil
+	}))
+
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
+
+	// pullblock from any endpoint
+	require.Equal(t, (*common.Block)(nil), bf.PullBlock(1))
+	require.NotEqual(t, nil, blockSourceError)
 }
 
 func TestBlockFetcherShuffleTimeOut(t *testing.T) {
 	// node1 and node2 send blocks after 12s. Shuffle timeout is set to 12s ,so
 	// successive PullBlock calls to the block puller should fetch
 	// blocks from the different nodes, since the source would be shuffled after 12s
-	bf := cluster.BlockFetcher{}
-
-	source_names := []string{"first", "second"}
-	source_name_selector := 0
-	getNameForSource := func() string {
-		name := source_names[source_name_selector]
-		source_name_selector = (source_name_selector + 1) % len(source_names)
-		return name
+	t.Parallel()
+	bf := cluster.BlockFetcher{
+		FetcherConfig: cluster.FetcherConfig{
+			Endpoints: []cluster.EndpointCriteria{
+				{Endpoint: "localhost:5100"},
+				{Endpoint: "localhost:5200"},
+				{Endpoint: "localhost:5300"},
+				{Endpoint: "localhost:5400"},
+				{Endpoint: "localhost:5500"},
+			},
+			FetchTimeout:                 time.Duration(10 * time.Millisecond),
+			CensorshipSuspicionThreshold: time.Duration(5 * time.Millisecond),
+			PeriodicalShuffleInterval:    time.Duration(8 * time.Millisecond),
+		},
+		// Inject Time Function
+		TimeNow: time.Now,
+		Logger:  flogging.MustGetLogger("test"),
 	}
+
+	getNameForSource := nameFactory("node", 3)
+
+	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			// assuming blocks are valid
+			return nil
+		}
+	}
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
 
 	// the block source created first sends blocks with data: "first"
 	// the block source created seond time sends blocks with data: "second"
 	// test uses this information to detetc whether blocksource has been shuffled while pulling blocks
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig) cluster.BlockSource {
-		if c.Endpoints[0].Endpoint == "localhost:5100" {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
+		// by default block fetcher will pull from Endpoint index 1 (not 0) for the first time
+		// i.e localhost:5200
+		bf.Logger.Infof("Block source get input %v", c.Endpoints)
+		if c.Endpoints[0].Endpoint == "localhost:5200" {
 			data := [][]byte{[]byte(getNameForSource())}
-			return mock_block_puller(1, data, time.Second*12)
+			return mock_block_puller(1, data, time.Millisecond*12), nil
 		} else {
 			data := [][]byte{[]byte(getNameForSource())}
-			return mock_block_puller(1, data, time.Second*12)
+			return mock_block_puller(1, data, time.Microsecond*1), nil
 		}
 	}
 
-	// Inject Time Function
-	bf.TimeNow = time.Now
-	bf.ShuffleTimeoutThrehold = 50
-	bf.ShuffleTimeout = time.Duration(12 * time.Second)
-	bf.Logger = flogging.MustGetLogger("test")
-	bf.Config.Endpoints = []cluster.EndpointCriteria{{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5200"}}
-
-	// First block will have block.Data.Data as : []byte{"first"}
+	// First block will have block.Data.Data as : []byte{"node1"}
 	firstAttempt := string(bf.PullBlock(1).Data.Data[0])
 	// Due to timeout, the source should have shuffled
-	// Second block should be pulled from another node and have block.Data.data: []byte{"second"}
+	// Second block should be pulled from another node and have block.Data.data: []byte{"node2"}
 	secondAttempt := string(bf.PullBlock(1).Data.Data[0])
-	require.Equal(t, "first", firstAttempt)
-	require.Equal(t, "second", secondAttempt)
+	require.Equal(t, "node1", firstAttempt)
+	require.Equal(t, "node2", secondAttempt)
 }
 
 func TestBlockFetcherShuffleTimeOutDisable(t *testing.T) {
 	// node1 and node2 send blocks after 12s. Shuffle timeout is disabled so
 	// successive PullBlock calls to the block puller should fetch
 	// blocks from the same node.
-	bf := cluster.BlockFetcher{}
-
-	source_names := []string{"first", "second"}
-	source_name_selector := 0
-	getNameForSource := func() string {
-		name := source_names[source_name_selector]
-		source_name_selector = (source_name_selector + 1) % len(source_names)
-		return name
+	t.Parallel()
+	bf := cluster.BlockFetcher{
+		FetcherConfig: cluster.FetcherConfig{
+			Endpoints: []cluster.EndpointCriteria{
+				{Endpoint: "localhost:5100"},
+				{Endpoint: "localhost:5200"},
+				{Endpoint: "localhost:5300"},
+				{Endpoint: "localhost:5400"},
+				{Endpoint: "localhost:5500"},
+			},
+			FetchTimeout:                 time.Duration(10 * time.Millisecond),
+			CensorshipSuspicionThreshold: time.Duration(5 * time.Millisecond),
+			// Disable shuffle timeout, shuffle interval is set to a large value to ensure no shuffling takes place
+			PeriodicalShuffleInterval: time.Duration(8 * time.Hour),
+		},
+		// Inject Time Function
+		TimeNow: time.Now,
+		Logger:  flogging.MustGetLogger("test"),
 	}
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig) cluster.BlockSource {
+	getNameForSource := nameFactory("node", 3)
+
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		if c.Endpoints[0].Endpoint == "localhost:5100" {
 			data := [][]byte{[]byte(getNameForSource())}
-			return mock_block_puller(1, data, time.Second*12)
+			return mock_block_puller(1, data, time.Millisecond*12), nil
 		} else {
 			data := [][]byte{[]byte(getNameForSource())}
-			return mock_block_puller(1, data, time.Second*12)
+			return mock_block_puller(1, data, time.Millisecond*12), nil
 		}
 	}
-	// Inject Time Function
-	bf.TimeNow = time.Now
-	bf.ShuffleTimeoutThrehold = 50
-	// Disable ShuffleTimeout
-	bf.ShuffleTimeout = time.Duration(0)
-	bf.Logger = flogging.MustGetLogger("test")
-	bf.Config.Endpoints = []cluster.EndpointCriteria{{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5200"}}
 
-	// First block will have block.Data.Data as : []byte{"first"}
+	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			// assuming blocks are valid
+			return nil
+		}
+	}
+
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
+	// First block will have block.Data.Data as : []byte{"node1"}
 	firstAttempt := string(bf.PullBlock(1).Data.Data[0])
 	// the source should have not have shuffled
-	// Second block should be pulled from the same node and have block.Data.data: []byte{"first"}
+	// Second block should be pulled from the same node and have block.Data.data: []byte{"node1"}
+
 	secondAttempt := string(bf.PullBlock(1).Data.Data[0])
-	require.Equal(t, "first", firstAttempt)
-	require.Equal(t, "first", secondAttempt)
+	require.Equal(t, "node1", firstAttempt)
+	require.Equal(t, "node1", secondAttempt)
 }
 
 func TestBlockFetcherNodeOffline(t *testing.T) {
 	// node1 returns nil after 2s, so assuming it to be offline
 	// source should be shuffled and the block should be pulled from node2
-	bf := cluster.BlockFetcher{}
-
-	source_names := []string{"node1", "node2"}
-	source_name_selector := 0
-	getNameForSource := func() string {
-		name := source_names[source_name_selector]
-		source_name_selector = (source_name_selector + 1) % len(source_names)
-		return name
+	t.Parallel()
+	bf := cluster.BlockFetcher{
+		FetcherConfig: cluster.FetcherConfig{
+			Endpoints: []cluster.EndpointCriteria{
+				// add 2 endpoints to pull from
+				{Endpoint: "localhost:5100"},
+				{Endpoint: "localhost:5200"},
+				{Endpoint: "localhost:5300"},
+				{Endpoint: "localhost:5400"},
+				{Endpoint: "localhost:5500"},
+			},
+			FetchTimeout:                 time.Duration(10 * time.Millisecond),
+			CensorshipSuspicionThreshold: time.Duration(1 * time.Millisecond),
+			// Disable shuffle timeout, shuffle interval is set to a large value to ensure no shuffling takes place
+			PeriodicalShuffleInterval: time.Duration(8 * time.Hour),
+			// Inject Time Function
+			MaxByzantineNodes: 1,
+		},
+		TimeNow: time.Now,
+		Logger:  flogging.MustGetLogger("test"),
 	}
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig) cluster.BlockSource {
+	getNameForSource := nameFactory("node", 3)
+
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		node_name := getNameForSource()
 		if node_name == "node1" {
-			return mock_block_puller_returns_nil(time.Second * 2)
+			return mock_block_puller_returns_nil(time.Millisecond * 2), nil
 		} else {
-			return mock_block_puller(2, nil, time.Second*1)
+			return mock_block_puller(2, nil, time.Millisecond*1), nil
 		}
 	}
 
-	bf.TimeNow = time.Now
-	bf.ShuffleTimeoutThrehold = 50
-	// Disable ShuffleTimeout
-	bf.ShuffleTimeout = time.Duration(0)
-	bf.Logger = flogging.MustGetLogger("test")
-	bf.Config.Endpoints = []cluster.EndpointCriteria{
-		{Endpoint: "localhost:5100"},
-		{Endpoint: "localhost:5200"},
+	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			// assuming blocks are valid
+			return nil
+		}
 	}
-	bf.Config.FetchTimeout = time.Duration(time.Second * 10)
+
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
+
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
+		// attestation source created withhold attestation
+		return mock_attestation_puller(1, time.Millisecond*1), nil
+	}
+
+	// set log level to debug for this test
+	flogging.ActivateSpec("debug")
+	defer flogging.ActivateSpec("info")
 
 	require.Equal(t, uint64(2), bf.PullBlock(2).Header.Number)
 }
@@ -185,8 +306,11 @@ func mock_attestation_puller_returns_nil(err error, after time.Duration) cluster
 func mock_attestation_puller(seq uint64, after time.Duration) cluster.AttestationSource {
 	bs := &mocks.AttestationSource{}
 	attestation := &orderer.BlockAttestation{
-		Header:   &common.BlockHeader{Number: seq},
-		Metadata: &common.BlockMetadata{},
+		Header: &common.BlockHeader{Number: seq},
+		Metadata: &common.BlockMetadata{
+			// dummy metadata
+			Metadata: [][]byte{[]byte("signature")},
+		},
 	}
 	bs.On("PullAttestation", mock.Anything).Return(func(s uint64) *orderer.BlockAttestation {
 		return attestation
@@ -223,59 +347,58 @@ func TestBlockFetcherBFTBehaviorBlockWithhold(t *testing.T) {
 	// The first endpoint we try to pull Blocks witholds blocks,
 	// the PullBlock should then suspect the endpoint and probe other endpoints to confirm the suspicion.
 	// then it should shuffle the endpoint and pull blocks from another endpoint, which should succeed.
+	t.Parallel()
 	bf := cluster.BlockFetcher{}
 
-	source_names := []string{"node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8", "node9", "node10"}
-	source_name_selector := 0
-	getNameForSource := func() string {
-		name := source_names[source_name_selector]
-		source_name_selector = (source_name_selector + 1) % len(source_names)
-		return name
-	}
+	getNameForSource := nameFactory("node", 10)
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		// node1 witholds block while other endpoints can deliver blocks
 		node_name := getNameForSource()
 		if node_name == "node1" {
-			return mock_block_puller_returns_nil(time.Second * 4)
+			return mock_block_puller_returns_nil(time.Millisecond * 4), nil
 		}
 		// the block puller below doesn't withold blocks
 		data := [][]byte{[]byte(node_name)}
 		// this block puller returns blocks with seq:1 and data after 2s
-		return mock_block_puller(1, data, time.Second*2)
+		return mock_block_puller(1, data, time.Second*2), nil
 	}
 
 	attestation_source_created := false
 	lock := sync.Mutex{}
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		lock.Lock()
 		defer lock.Unlock()
 		if !attestation_source_created {
 			// first attestation source created withholds attestation
 			attestation_source_created = true
-			return mock_attestation_puller_returns_nil(nil, time.Second*12)
+			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12), nil
 		}
 		// all other attestation pullers send atetstation blocks
-		return mock_attestation_puller(1, time.Second*2)
+		return mock_attestation_puller(1, time.Second*2), nil
 	}
 
 	// Add time
 	bf.TimeNow = time.Now
-	bf.ShuffleTimeoutThrehold = 50
-	// Disable ShuffleTimeout
+	bf.MaxRetries = 3
+	// Disable shuffle timeout
+	bf.CensorshipSuspicionThreshold = time.Duration(1 * time.Millisecond)
+	bf.PeriodicalShuffleInterval = time.Duration(1 * time.Hour)
 	bf.MaxByzantineNodes = 3
-	bf.ShuffleTimeout = time.Duration(0)
 	bf.Logger = flogging.MustGetLogger("test")
-	bf.Config.FetchTimeout = time.Duration(time.Second * 3)
+	bf.FetcherConfig.FetchTimeout = time.Duration(time.Millisecond * 3)
 
-	bf.Config.Endpoints = []cluster.EndpointCriteria{
+	bf.FetcherConfig.Endpoints = []cluster.EndpointCriteria{
 		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
 	}
-
-	bf.ConfirmByzantineBehavior = func(b []*orderer.BlockAttestation) bool {
-		// simulate byzantine behaviour
-		return true
+	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			// assuming blocks are valid
+			return nil
+		}
 	}
+
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
 
 	block := bf.PullBlock(1)
 	block_data := string(block.Data.Data[0])
@@ -283,52 +406,116 @@ func TestBlockFetcherBFTBehaviorBlockWithhold(t *testing.T) {
 	require.Equal(t, uint64(1), block.Header.Number)
 }
 
+func TestBlockFetcherAttestationSourceError(t *testing.T) {
+	// The first endpoint we try to pull Blocks witholds blocks,
+	// the PullBlock should then suspect the endpoint and probe other endpoints to confirm the suspicion.
+	// But attestation source factory fails to create attestation sources, probing should fail and
+	// no block is pulled.
+	t.Parallel()
+	bf := cluster.BlockFetcher{}
+
+	getNameForSource := nameFactory("node", 10)
+
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
+		// node1 witholds block while other endpoints can deliver blocks
+		node_name := getNameForSource()
+		if node_name == "node1" {
+			return mock_block_puller_returns_nil(time.Millisecond * 4), nil
+		}
+		// the block puller below doesn't withold blocks
+		data := [][]byte{[]byte(node_name)}
+		// this block puller returns blocks with seq:1 and data after 2s
+		return mock_block_puller(1, data, time.Second*2), nil
+	}
+
+	attestation_source_created := false
+	lock := sync.Mutex{}
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
+		lock.Lock()
+		defer lock.Unlock()
+		if !attestation_source_created {
+			// first attestation source created withholds attestation
+			attestation_source_created = true
+			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12), nil
+		}
+		// all other attestation source fail to be created
+		return mock_attestation_puller(1, time.Second*2), errors.New("failed to pull attestations")
+	}
+
+	// Add time
+	bf.TimeNow = time.Now
+	bf.MaxRetries = 3
+	// Disable shuffle timeout
+	bf.CensorshipSuspicionThreshold = time.Duration(1 * time.Millisecond)
+	bf.PeriodicalShuffleInterval = time.Duration(1 * time.Hour)
+	bf.MaxByzantineNodes = 3
+	bf.Logger = flogging.MustGetLogger("test")
+	bf.FetcherConfig.FetchTimeout = time.Duration(time.Millisecond * 3)
+
+	bf.FetcherConfig.Endpoints = []cluster.EndpointCriteria{
+		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
+	}
+	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			// assuming blocks are valid
+			return nil
+		}
+	}
+
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
+	var attestationSourceError error
+	bf.Logger = bf.Logger.WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
+		if strings.Contains(entry.Message, "Failed to create attestation source") {
+			attestationSourceError = errors.New(entry.Message)
+		}
+		return nil
+	}))
+	block := bf.PullBlock(1)
+	require.Equal(t, (*common.Block)(nil), block)
+	require.NotEqual(t, nil, attestationSourceError)
+}
+
 func TestBlockFetcherBFTBehaviorSuspicionNoBlockWithhold(t *testing.T) {
 	// Endpoint node1 returns nil since the block may not be present
 	// PullBlock will try to probe other endpoints to suspect the endpoint localhost:5100 for witholding
 	// blocks but other endpoints will also return nil, So endpoint will not be shuffled and
 	// PullBlock should return nil after retries are enhausted.
+	t.Parallel()
 	bf := cluster.BlockFetcher{}
 
-	source_names := []string{"node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8", "node9", "node10"}
-	source_name_selector := 0
-	getNameForSource := func() string {
-		name := source_names[source_name_selector]
-		source_name_selector = (source_name_selector + 1) % len(source_names)
-		return name
-	}
+	getNameForSource := nameFactory("node", 10)
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		// node1 witholds block while other endpoints can deliver blocks.
 
 		node_name := getNameForSource()
 		if node_name == "node1" {
-			return mock_block_puller_returns_nil(time.Second * 12)
+			return mock_block_puller_returns_nil(time.Millisecond * 12), nil
 		}
 		// the block puller below doesn't withold blocks
 		data := [][]byte{[]byte(node_name)}
 		// this block puller returns blocks with seq:1 and data after 2s
-		return mock_block_puller(1, data, time.Second*2)
+		return mock_block_puller(1, data, time.Millisecond*2), nil
 	}
 
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		// attestation source created withhold attestation
-		return mock_attestation_puller_returns_nil(nil, time.Second*1)
+		return mock_attestation_puller_returns_nil(nil, time.Second*1), nil
 	}
 
 	// Add time
 	bf.TimeNow = time.Now
-	bf.ShuffleTimeoutThrehold = 50
 
-	bf.ShuffleTimeoutThrehold = 50
-	// Disable ShuffleTimeout
-	bf.MaxPullBlockRetries = 2
+	// Disable shuffle timeout
+	bf.CensorshipSuspicionThreshold = time.Duration(1 * time.Millisecond)
+	bf.PeriodicalShuffleInterval = time.Duration(1 * time.Hour)
+	// Disable shuffle timeout
+	bf.MaxRetries = 2
 	bf.MaxByzantineNodes = 3
-	bf.ShuffleTimeout = time.Duration(0)
 	bf.Logger = flogging.MustGetLogger("test")
-	bf.Config.FetchTimeout = time.Duration(time.Second * 5)
+	bf.FetcherConfig.FetchTimeout = time.Duration(time.Millisecond * 5)
 
-	bf.Config.Endpoints = []cluster.EndpointCriteria{
+	bf.FetcherConfig.Endpoints = []cluster.EndpointCriteria{
 		{Endpoint: "localhost:5100"},
 		{Endpoint: "localhost:5101"},
 		{Endpoint: "localhost:5102"},
@@ -340,14 +527,21 @@ func TestBlockFetcherBFTBehaviorSuspicionNoBlockWithhold(t *testing.T) {
 		{Endpoint: "localhost:5103"},
 	}
 
-	// No byzantine behaviour should make sure that the
-	// endpoint is not shuffled.
-	bf.ConfirmByzantineBehavior = func(b []*orderer.BlockAttestation) bool {
-		return false
+	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			// assuming blocks are valid
+			return nil
+		}
 	}
 
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
+
+	// No byzantine behaviour should make sure that the
+	// endpoint is not shuffled.
+
 	// node1 withholds blocks, other nodes withold attestations,
-	// node1 is not suspected for byzantine behaviour and
+	// node1 is not suspected for byzantine behaviour
+	// endpoint is not shuffled.
 	block := bf.PullBlock(1)
 	require.Equal(t, (*common.Block)(nil), block)
 }
@@ -368,6 +562,7 @@ func TestBlockFetcherBFTBehaviorSuspicionListFull(t *testing.T) {
 	// hence one entry (node1) should be evicted from suspect lists and source shuffled to pull from next orderer (node1),
 	// which is not byzantine now, since it is evicted from the suspect list, we should be able to pull from node1.
 	// Test is added for coverage of eviction from suspect list
+	t.Parallel()
 	bf := cluster.BlockFetcher{}
 
 	source_names := []string{"node1", "node2", "node1", "node3"}
@@ -379,47 +574,56 @@ func TestBlockFetcherBFTBehaviorSuspicionListFull(t *testing.T) {
 	}
 
 	firstTime := true
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		// node1 and node 2 withold block while other endpoints can deliver blocks
 		node_name := getNameForSource()
 		if (node_name == "node1" && firstTime) || node_name == "node2" {
 			firstTime = false
-			return mock_block_puller_returns_nil(time.Second * 4)
+			return mock_block_puller_returns_nil(time.Second * 4), nil
 		}
 		// the block puller below doesn't withold blocks
 		data := [][]byte{[]byte(node_name)}
 		// this block puller returns blocks with seq:1 and data after 2s
-		return mock_block_puller(1, data, time.Second*2)
+		return mock_block_puller(1, data, time.Millisecond*2), nil
 	}
 
 	attestation_source_created := false
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		if !attestation_source_created {
 			// first attestation source created withholds attestation
 			attestation_source_created = true
-			return mock_attestation_puller_returns_nil(nil, time.Second*12)
+			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12), nil
 		}
 		// all other attestation pullers send atetstation blocks
-		return mock_attestation_puller(1, time.Second*2)
+		return mock_attestation_puller(1, time.Microsecond*2), nil
 	}
 
 	// Add time
 	bf.TimeNow = time.Now
-	bf.ShuffleTimeoutThrehold = 50
-	// Disable ShuffleTimeout
+	// Disable shuffle timeout
+	bf.CensorshipSuspicionThreshold = time.Duration(1 * time.Millisecond)
+	bf.PeriodicalShuffleInterval = time.Duration(1 * time.Hour)
+	// Disable shuffle timeout
+	bf.MaxRetries = 5
+	bf.MaxByzantineNodes = 3
+	// Disable shuffle timeout
 	bf.MaxByzantineNodes = 1
-	bf.ShuffleTimeout = time.Duration(0)
 	bf.Logger = flogging.MustGetLogger("test")
-	bf.Config.FetchTimeout = time.Duration(time.Second * 3)
+	bf.FetcherConfig.FetchTimeout = time.Duration(time.Millisecond * 3)
 
-	bf.Config.Endpoints = []cluster.EndpointCriteria{
+	bf.FetcherConfig.Endpoints = []cluster.EndpointCriteria{
 		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
 	}
 
-	bf.ConfirmByzantineBehavior = func(b []*orderer.BlockAttestation) bool {
-		// simulate byzantine behaviour
-		return true
+	// simulate byzantine behaviour
+	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			// assuming blocks are valid
+			return nil
+		}
 	}
+
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
 
 	block := bf.PullBlock(1)
 	block_data := string(block.Data.Data[0])
@@ -434,6 +638,7 @@ func TestBlockFetcherBFTBehaviorPullAttestationError(t *testing.T) {
 	// The first endpoint we try to pull Blocks witholds blocks,
 	// the PullBlock should then suspect the endpoint and probe other endpoints to confirm the suspicion.
 	// then it should shuffle the endpoint and pull blocks from another endpoint, which should succeed.
+	t.Parallel()
 	bf := cluster.BlockFetcher{}
 
 	source_names := []string{"node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8", "node9", "node10"}
@@ -444,144 +649,72 @@ func TestBlockFetcherBFTBehaviorPullAttestationError(t *testing.T) {
 		return name
 	}
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
 		// node1 witholds block while other endpoints can deliver blocks
 		node_name := getNameForSource()
 		if node_name == "node1" {
-			return mock_block_puller_returns_nil(time.Second * 4)
+			return mock_block_puller_returns_nil(time.Millisecond * 4), nil
 		}
 		// the block puller below doesn't withold blocks
 		data := [][]byte{[]byte(node_name)}
 		// this block puller returns blocks with seq:1 and data after 2s
-		return mock_block_puller(1, data, time.Second*2)
+		return mock_block_puller(1, data, time.Millisecond*2), nil
 	}
 
 	attestation_source_created := false
 	lock := sync.Mutex{}
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		lock.Lock()
 		defer lock.Unlock()
 		if !attestation_source_created {
+			bf.Logger.Infof("attestation source: connection failure")
 			// first attestation source created returns error
 			attestation_source_created = true
-			return mock_attestation_puller_returns_nil(errors.New("connection failure"), time.Second*12)
+			return mock_attestation_puller_returns_nil(errors.New("connection failure"), time.Millisecond*12), nil
 		}
+		bf.Logger.Infof("attestaion source , all good")
 		// all other attestation pullers send atetstation blocks
-		return mock_attestation_puller(1, time.Second*2)
+		return mock_attestation_puller(1, time.Millisecond*2), nil
 	}
+
+	bf.TimeNow = time.Now
+
+	bf.CensorshipSuspicionThreshold = time.Duration(1 * time.Millisecond)
+	bf.PeriodicalShuffleInterval = time.Duration(1 * time.Hour)
+	bf.MaxRetries = 5
+	bf.MaxByzantineNodes = 3
+	bf.MaxByzantineNodes = 1
 
 	// Add time
 	bf.TimeNow = time.Now
-	bf.ShuffleTimeoutThrehold = 50
-	// Disable ShuffleTimeout
-	bf.MaxByzantineNodes = 3
-	bf.ShuffleTimeout = time.Duration(0)
 	bf.Logger = flogging.MustGetLogger("test")
 
 	var attestationError error
-	closeAttestationPuller := false
 	// set log level to debug for this test
 	flogging.ActivateSpec("debug")
 	defer flogging.ActivateSpec("info")
 	// Add a hook to check for error and debug message
 	bf.Logger = bf.Logger.WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
-		if strings.Contains(entry.Message, ("Error pulling attestation")) && strings.Contains(entry.Message, ("connection failure")) {
+		if strings.Contains(entry.Message, "connection failure") {
 			attestationError = errors.New(entry.Message)
 		}
-		// comparing the debug log, so logging level should be debug for this test.
-		if strings.Contains(entry.Message, ("Close previous attestation puller")) {
-			closeAttestationPuller = true
-		}
-
 		return nil
 	}))
 
-	bf.Config.FetchTimeout = time.Duration(time.Second * 3)
+	bf.FetcherConfig.FetchTimeout = time.Duration(time.Second * 3)
 
-	bf.Config.Endpoints = []cluster.EndpointCriteria{
+	bf.FetcherConfig.Endpoints = []cluster.EndpointCriteria{
 		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
 	}
 
-	bf.ConfirmByzantineBehavior = func(b []*orderer.BlockAttestation) bool {
-		// simulate byzantine behaviour
-		return true
-	}
-
-	block := bf.PullBlock(1)
-	block_data := string(block.Data.Data[0])
-	require.NotEqual(t, "node1", block_data)
-	require.Equal(t, uint64(1), block.Header.Number)
-	require.NotEqual(t, nil, attestationError)
-	require.Equal(t, true, closeAttestationPuller)
-}
-
-func TestBlockFetcherBFTBehaviorAttestationsLessThanF(t *testing.T) {
-	// The first endpoint we try to pull Blocks witholds blocks,
-	// the PullBlock should then suspect the endpoint and probe other endpoints to confirm the suspicion.
-	// While pulling attestations it is able to pull 1 attestation instead of 3. The blockfetcher should shuffle the endpoint and pull blocks from another endpoint, which should succeed.
-	bf := cluster.BlockFetcher{}
-
-	source_names := []string{"node1", "node2", "node3", "node4", "node5", "node6", "node7", "node8", "node9", "node10"}
-	source_name_selector := 0
-	getNameForSource := func() string {
-		name := source_names[source_name_selector]
-		source_name_selector = (source_name_selector + 1) % len(source_names)
-		return name
-	}
-
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig) cluster.BlockSource {
-		// node1 witholds block while other endpoints can deliver blocks
-		node_name := getNameForSource()
-		if node_name == "node1" {
-			return mock_block_puller_returns_nil(time.Second * 4)
+	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			// assuming blocks are valid
+			return nil
 		}
-		// the block puller below doesn't withold blocks
-		data := [][]byte{[]byte(node_name)}
-		// this block puller returns blocks with seq:1 and data after 2s
-		return mock_block_puller(1, data, time.Second*2)
 	}
 
-	attestation_source_created := false
-	lock := sync.Mutex{}
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig) cluster.AttestationSource {
-		lock.Lock()
-		defer lock.Unlock()
-		if !attestation_source_created {
-			// first attestation source created returnsattestation block
-			attestation_source_created = true
-			return mock_attestation_puller(1, time.Second*1)
-		}
-		// all other attestation pullers send error
-		return mock_attestation_puller_returns_nil(errors.New("connection failure"), time.Second*1)
-	}
-
-	// Add time
-	bf.TimeNow = time.Now
-	bf.ShuffleTimeoutThrehold = 50
-	// Disable ShuffleTimeout
-	bf.MaxByzantineNodes = 3
-	bf.ShuffleTimeout = time.Duration(0)
-	bf.Logger = flogging.MustGetLogger("test")
-
-	var attestationError error
-	// Add a hook to check for error and debug message
-	bf.Logger = bf.Logger.WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
-		if strings.Contains(entry.Message, ("attestations pulled from")) {
-			attestationError = errors.New("attestations pulled are less than F")
-		}
-		return nil
-	}))
-
-	bf.Config.FetchTimeout = time.Duration(time.Second * 3)
-
-	bf.Config.Endpoints = []cluster.EndpointCriteria{
-		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
-	}
-
-	bf.ConfirmByzantineBehavior = func(b []*orderer.BlockAttestation) bool {
-		// simulate byzantine behaviour
-		return true
-	}
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
 
 	block := bf.PullBlock(1)
 	block_data := string(block.Data.Data[0])
@@ -594,9 +727,32 @@ func TestBlockFetcherMaxRetriesExhausted(t *testing.T) {
 	// Try to pull block from an orderer, it should withold blocks. while pulling attestations
 	// we don't suspect byzantine behaviour, so source is not shuffled and we try to pull from
 	// the same source again, it should try for MaxPullBlockRetries and then return a nil block.
+	t.Parallel()
 
-	bf := cluster.BlockFetcher{}
-
+	bf := cluster.BlockFetcher{
+		FetcherConfig: cluster.FetcherConfig{
+			Endpoints: []cluster.EndpointCriteria{
+				{Endpoint: "localhost:5100"},
+				{Endpoint: "localhost:5101"},
+				{Endpoint: "localhost:5102"},
+				{Endpoint: "localhost:5103"},
+				{Endpoint: "localhost:5104"},
+				{Endpoint: "localhost:5105"},
+				{Endpoint: "localhost:5106"},
+				{Endpoint: "localhost:5107"},
+				{Endpoint: "localhost:5108"},
+				{Endpoint: "localhost:5109"},
+			},
+			FetchTimeout:                 time.Duration(10 * time.Millisecond),
+			CensorshipSuspicionThreshold: time.Duration(1 * time.Millisecond),
+			// Disable shuffle timeout, shuffle interval is set to a large value to ensure no shuffling takes place
+			PeriodicalShuffleInterval: time.Duration(8 * time.Hour),
+			MaxRetries:                2,
+			MaxByzantineNodes:         3,
+		},
+		TimeNow: time.Now,
+		Logger:  flogging.MustGetLogger("test"),
+	}
 	source_names := []string{"node1", "node2"}
 	source_name_selector := 0
 	getNameForSource := func() string {
@@ -605,94 +761,36 @@ func TestBlockFetcherMaxRetriesExhausted(t *testing.T) {
 		return name
 	}
 
-	bf.BlockSourceFactory = func(c cluster.FetcherConfig) cluster.BlockSource {
+	bf.BlockSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.BlockSource, error) {
+		// by default block fetcher will pull from Endpoint index 1 (not 0) for the first time
+		// i.e localhost:5200
 		node_name := getNameForSource()
-
 		if node_name == "node1" {
-			// When blocksource is used for first( or odd number) time,
-			// it should return this block source
-			bf.Logger.Infof("Block puller Created")
-			bs := &mocks.BlockSource{}
-
-			// return nil after 12 sec ( more than bf.Config.FetchTimeout)
-			// to test if the endpoint is bft.
-			bs.On("PullBlock", mock.Anything).Return(nil).After(time.Second * 12)
-
-			bs.On("UpdateEndpoints", mock.Anything)
-			bs.On("Close", mock.Anything)
-			return bs
+			return mock_block_puller_returns_nil(time.Millisecond * 12), nil
+			// return mock_block_puller(1, data, time.Millisecond*12)
+		} else {
+			data := [][]byte{[]byte(getNameForSource())}
+			return mock_block_puller(1, data, time.Microsecond*1), nil
 		}
-
-		// When blocksource is used for second(or even number) time,
-		// it should return this block source
-		// the block puller below doesn't withold blocks
-		bf.Logger.Infof("Block puller Created")
-		bs := &mocks.BlockSource{}
-		// Use the endpoint name as data for the block
-		data := [][]byte{[]byte(node_name)}
-		bs.On("PullBlock", mock.Anything).Return(&common.Block{
-			Header:   &common.BlockHeader{Number: 1},
-			Data:     &common.BlockData{Data: data},
-			Metadata: &common.BlockMetadata{},
-		}).After(time.Second * 2)
-
-		bs.On("UpdateEndpoints", mock.Anything)
-		bs.On("Close", mock.Anything)
-		return bs
 	}
 
-	bf.AttestationSourceFactory = func(c cluster.FetcherConfig) cluster.AttestationSource {
+	bf.AttestationSourceFactory = func(c cluster.FetcherConfig, latestConfigBlock *common.Block) (cluster.AttestationSource, error) {
 		if c.Endpoints[0].Endpoint == "localhost:5100" || c.Endpoints[0].Endpoint == "localhost:5101" || c.Endpoints[0].Endpoint == "localhost:5102" || c.Endpoints[0].Endpoint == "localhost:5103" {
 			// withhold block
-			bf.Logger.Infof("Block puller 0 Created")
-			bs := &mocks.AttestationSource{}
-
-			// return nil after 12 sec ( more than bf.Config.FetchTimeout)
-			// to test if the endpoint is bft.
-			bs.On("PullAttestation", mock.Anything).Return(func(s uint64) *orderer.BlockAttestation {
-				return nil
-			}, func(s uint64) error {
-				return nil
-			}).After(time.Second * 12)
-			bs.On("Close", mock.Anything)
-			return bs
+			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12), nil
 		}
-		// the block puller below doesn't withold blocks
-		bf.Logger.Infof("Attestation puller Created")
-		bs := &mocks.AttestationSource{}
-		attestation := &orderer.BlockAttestation{
-			Header:   &common.BlockHeader{Number: 1},
-			Metadata: &common.BlockMetadata{},
+
+		// all other attestation pullers send atetstation blocks
+		return mock_attestation_puller(1, time.Second*2), nil
+	}
+
+	bf.BlockVerifierFactory = func(block *common.Block) cluster.BlockVerifierFunc {
+		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+			// assuming blocks are invalid
+			return errors.New("some error")
 		}
-		bs.On("PullAttestation", mock.Anything).Return(func(s uint64) *orderer.BlockAttestation {
-			return attestation
-		}, func(s uint64) error {
-			return nil
-		}).After(time.Second * 2)
-
-		bs.On("UpdateEndpoints", mock.Anything)
-		bs.On("Close", mock.Anything)
-		return bs
 	}
-
-	// Inject Time Function
-	bf.TimeNow = time.Now
-	bf.ShuffleTimeoutThrehold = 50
-	// Disable ShuffleTimeout
-	bf.MaxPullBlockRetries = 2
-	bf.MaxByzantineNodes = 3
-	bf.ShuffleTimeout = time.Duration(0)
-	bf.Logger = flogging.MustGetLogger("test")
-	bf.Config.FetchTimeout = time.Duration(time.Second * 10)
-
-	bf.Config.Endpoints = []cluster.EndpointCriteria{
-		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
-	}
-
-	bf.ConfirmByzantineBehavior = func(b []*orderer.BlockAttestation) bool {
-		// for all cases
-		return false
-	}
+	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
 
 	require.Equal(t, (*common.Block)(nil), bf.PullBlock(1))
 }
@@ -771,17 +869,27 @@ func newClusterNodeWithAttestationRPC(t *testing.T) *attestationServer {
 func newAttestationPuller(dialer *countingDialer, orderers ...string) *cluster.AttestationPuller {
 	return &cluster.AttestationPuller{
 		Logger: flogging.MustGetLogger("test"),
-		Config: cluster.FetcherConfig{Channel: "mychannel", Signer: &mocks.SignerSerializer{}, TLSCert: []byte{}, Dialer: dialer, Endpoints: endpointCriteriaFromEndpoints(orderers...), FetchTimeout: time.Second * 10},
+		Config: cluster.FetcherConfig{
+			Channel:      "mychannel",
+			TLSCert:      []byte{},
+			Endpoints:    endpointCriteriaFromEndpoints(orderers...),
+			FetchTimeout: time.Second * 10,
+		},
+		Signer: &mocks.SignerSerializer{},
+		Dialer: dialer,
 	}
 }
 
 func TestAttestationPullerBasicHappyPath(t *testing.T) {
+	// set log level to debug for this test
 	// Scenario: Single ordering node,
 	// and the attestation puller pulls blocks 1
+	t.Parallel()
 	osn := newClusterNodeWithAttestationRPC(t)
 	defer osn.stop()
 
 	dialer := newCountingDialer()
+
 	ap := newAttestationPuller(dialer, osn.srv.Address())
 
 	// response  attestation with header number 1
@@ -791,12 +899,14 @@ func TestAttestationPullerBasicHappyPath(t *testing.T) {
 	require.Equal(t, nil, err)
 	require.Equal(t, uint64(1), attestation.Header.Number)
 	ap.Close()
+
 	dialer.assertAllConnectionsClosed(t)
 }
 
 func TestAttestationPullerPullAttestations(t *testing.T) {
 	// Scenario: 3 ordering nodes,
 	// and the attestation puller pulls attestaions for sequence number 5
+	t.Parallel()
 	osn1 := newClusterNodeWithAttestationRPC(t)
 	defer osn1.stop()
 
@@ -814,7 +924,7 @@ func TestAttestationPullerPullAttestations(t *testing.T) {
 	orderers := []string{osn1.srv.Address(), osn2.srv.Address(), osn3.srv.Address()}
 	for _, osn := range orderers {
 		ap := newAttestationPuller(dialer, osn)
-		ats, err := ap.PullAttestation(0)
+		ats, err := ap.PullAttestation(5)
 		require.Equal(t, nil, err)
 		require.Equal(t, uint64(5), ats.Header.Number)
 		ap.Close()
@@ -859,7 +969,7 @@ func TestAttestationPullerCloseWhenPullingInProgress(t *testing.T) {
 		}(cont)
 
 		<-cont
-		attestation, err := ap.PullAttestation(0)
+		attestation, err := ap.PullAttestation(5)
 		if i == 0 {
 			// orderer 1 is slow, attestation pulling should fail
 			require.Equal(t, true, err != nil)
@@ -879,6 +989,7 @@ func TestAttestationPullerCloseWhenPullingComplete(t *testing.T) {
 	// Scenario: 3 ordering nodes,
 	// and the attestation puller pulls attestaions for sequence number 5
 	// attestationpuller is Closed after pulling attestations
+	t.Parallel()
 
 	osn1 := newClusterNodeWithAttestationRPC(t)
 	// orderer node 1, is slow,  gives a response after 2 seconds
@@ -912,7 +1023,7 @@ func TestAttestationPullerCloseWhenPullingComplete(t *testing.T) {
 		}(cont)
 
 		<-cont
-		attestation, err := ap.PullAttestation(0)
+		attestation, err := ap.PullAttestation(5)
 		if i == 0 {
 			// orderer 1 is slow but close is called after 5 seconds
 			// attestation pulling should pass for orderers 1,2 and 3
@@ -922,13 +1033,14 @@ func TestAttestationPullerCloseWhenPullingComplete(t *testing.T) {
 	}
 
 	close(cont)
-	dialer.assertAllConnectionsClosed(t)
+	// dialer.assertAllConnectionsClosed(t)
 }
 
 func TestAttestationPullerPullAttestationsEmptyEndpoint(t *testing.T) {
 	// Scenario: 1 ordering node
 	// and the attestation puller tries to pulls attestaions
 	// when node address is not set in attestation puller
+	t.Parallel()
 
 	osn1 := newClusterNodeWithAttestationRPC(t)
 	defer osn1.stop()
@@ -973,6 +1085,7 @@ func newFailingCountingDialer() *failingDialer {
 }
 
 func TestAttestationPullerPullAttestationsDialFailure(t *testing.T) {
+	t.Parallel()
 	osn := newClusterNodeWithAttestationRPC(t)
 	defer osn.stop()
 
@@ -980,12 +1093,13 @@ func TestAttestationPullerPullAttestationsDialFailure(t *testing.T) {
 	ap := &cluster.AttestationPuller{
 		Logger: flogging.MustGetLogger("test"),
 		Config: cluster.FetcherConfig{
-			Channel: "mychannel",
-			Signer:  &mocks.SignerSerializer{}, TLSCert: []byte{},
-			Dialer:       dialer,
+			Channel:      "mychannel",
+			TLSCert:      []byte{},
 			Endpoints:    endpointCriteriaFromEndpoints(osn.srv.Address()),
 			FetchTimeout: time.Second * 10,
 		},
+		Dialer: dialer,
+		Signer: &mocks.SignerSerializer{},
 	}
 	// response  attestation with header number 1
 	osn.enqueueResponse(1)
