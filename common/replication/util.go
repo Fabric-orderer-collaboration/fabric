@@ -7,18 +7,24 @@ SPDX-License-Identifier: Apache-2.0
 package replication
 
 import (
+	"bytes"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-config/protolator"
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/msp"
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/channelconfig"
+	"github.com/hyperledger/fabric/common/configtx"
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/policies"
+	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/internal/pkg/comm"
 	mspconstants "github.com/hyperledger/fabric/msp"
 	"github.com/hyperledger/fabric/protoutil"
@@ -47,6 +53,194 @@ type BlockSequenceVerifier func(blocks []*common.Block, channel string) error
 // Dialer creates a gRPC connection to a remote address
 type Dialer interface {
 	Dial(endpointCriteria EndpointCriteria) (*grpc.ClientConn, error)
+}
+
+//go:generate mockery -dir . -name BlockVerifier -case underscore -output ./mocks/
+
+// BlockVerifier verifies block signatures.
+type BlockVerifier interface {
+	// VerifyBlockSignature verifies a signature of a block.
+	// It has an optional argument of a configuration envelope
+	// which would make the block verification to use validation rules
+	// based on the given configuration in the ConfigEnvelope.
+	// If the config envelope passed is nil, then the validation rules used
+	// are the ones that were applied at commit of previous blocks.
+	VerifyBlockSignature(sd []*protoutil.SignedData, config *common.ConfigEnvelope) error
+}
+
+//go:generate mockery -dir . -name VerifierFactory -case underscore -output ./mocks/
+
+// VerifierFactory creates BlockVerifiers.
+type VerifierFactory interface {
+	// VerifierFromConfig creates a BlockVerifier from the given configuration.
+	VerifierFromConfig(configuration *common.ConfigEnvelope, channel string) (BlockVerifier, error)
+}
+
+// VerifyBlocks verifies the given consecutive sequence of blocks is valid,
+// and returns nil if it's valid, else an error.
+func VerifyBlocks(blockBuff []*common.Block, signatureVerifier BlockVerifier) error {
+	if len(blockBuff) == 0 {
+		return errors.New("buffer is empty")
+	}
+	// First, we verify that the block hash in every block is:
+	// Equal to the hash in the header
+	// Equal to the previous hash in the succeeding block
+	for i := range blockBuff {
+		if err := VerifyBlockHash(i, blockBuff); err != nil {
+			return err
+		}
+	}
+
+	var config *common.ConfigEnvelope
+	var isLastBlockConfigBlock bool
+	// Verify all configuration blocks that are found inside the block batch,
+	// with the configuration that was committed (nil) or with one that is picked up
+	// during iteration over the block batch.
+	for _, block := range blockBuff {
+		configFromBlock, err := ConfigFromBlock(block)
+		if err == ErrNotAConfig {
+			isLastBlockConfigBlock = false
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		// The block is a configuration block, so verify it
+		if err := VerifyBlockSignature(block, signatureVerifier, config); err != nil {
+			return err
+		}
+		config = configFromBlock
+		isLastBlockConfigBlock = true
+	}
+
+	// Verify the last block's signature
+	lastBlock := blockBuff[len(blockBuff)-1]
+
+	// If last block is a config block, we verified it using the policy of the previous block, so it's valid.
+	if isLastBlockConfigBlock {
+		return nil
+	}
+
+	return VerifyBlockSignature(lastBlock, signatureVerifier, config)
+}
+
+var ErrNotAConfig = errors.New("not a config block")
+
+// ConfigFromBlock returns a ConfigEnvelope if exists, or a *NotAConfigBlock error.
+// It may also return some other error in case parsing failed.
+func ConfigFromBlock(block *common.Block) (*common.ConfigEnvelope, error) {
+	if block == nil || block.Data == nil || len(block.Data.Data) == 0 {
+		return nil, errors.New("empty block")
+	}
+	txn := block.Data.Data[0]
+	env, err := protoutil.GetEnvelopeFromBlock(txn)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	payload, err := protoutil.UnmarshalPayload(env.Payload)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if block.Header.Number == 0 {
+		configEnvelope, err := configtx.UnmarshalConfigEnvelope(payload.Data)
+		if err != nil {
+			return nil, errors.Wrap(err, "invalid config envelope")
+		}
+		return configEnvelope, nil
+	}
+	if payload.Header == nil {
+		return nil, errors.New("nil header in payload")
+	}
+	chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if common.HeaderType(chdr.Type) != common.HeaderType_CONFIG {
+		return nil, ErrNotAConfig
+	}
+	configEnvelope, err := configtx.UnmarshalConfigEnvelope(payload.Data)
+	if err != nil {
+		return nil, errors.Wrap(err, "invalid config envelope")
+	}
+	return configEnvelope, nil
+}
+
+// VerifyBlockHash verifies the hash chain of the block with the given index
+// among the blocks of the given block buffer.
+func VerifyBlockHash(indexInBuffer int, blockBuff []*common.Block) error {
+	if len(blockBuff) <= indexInBuffer {
+		return errors.Errorf("index %d out of bounds (total %d blocks)", indexInBuffer, len(blockBuff))
+	}
+	block := blockBuff[indexInBuffer]
+	if block.Header == nil {
+		return errors.New("missing block header")
+	}
+	seq := block.Header.Number
+	dataHash := protoutil.BlockDataHash(block.Data)
+	// Verify data hash matches the hash in the header
+	if !bytes.Equal(dataHash, block.Header.DataHash) {
+		computedHash := hex.EncodeToString(dataHash)
+		claimedHash := hex.EncodeToString(block.Header.DataHash)
+		return errors.Errorf("computed hash of block (%d) (%s) doesn't match claimed hash (%s)",
+			seq, computedHash, claimedHash)
+	}
+	// We have a previous block in the buffer, ensure current block's previous hash matches the previous one.
+	if indexInBuffer > 0 {
+		prevBlock := blockBuff[indexInBuffer-1]
+		currSeq := block.Header.Number
+		if prevBlock.Header == nil {
+			return errors.New("previous block header is nil")
+		}
+		prevSeq := prevBlock.Header.Number
+		if prevSeq+1 != currSeq {
+			return errors.Errorf("sequences %d and %d were received consecutively", prevSeq, currSeq)
+		}
+		if !bytes.Equal(block.Header.PreviousHash, protoutil.BlockHeaderHash(prevBlock.Header)) {
+			claimedPrevHash := hex.EncodeToString(block.Header.PreviousHash)
+			actualPrevHash := hex.EncodeToString(protoutil.BlockHeaderHash(prevBlock.Header))
+			return errors.Errorf("block [%d]'s hash (%s) mismatches block [%d]'s prev block hash (%s)",
+				prevSeq, actualPrevHash, currSeq, claimedPrevHash)
+		}
+	}
+	return nil
+}
+
+// SignatureSetFromBlock creates a signature set out of a block.
+func SignatureSetFromBlock(block *common.Block) ([]*protoutil.SignedData, error) {
+	if block.Metadata == nil || len(block.Metadata.Metadata) <= int(common.BlockMetadataIndex_SIGNATURES) {
+		return nil, errors.New("no metadata in block")
+	}
+	metadata, err := protoutil.GetMetadataFromBlock(block, common.BlockMetadataIndex_SIGNATURES)
+	if err != nil {
+		return nil, errors.Errorf("failed unmarshalling medatata for signatures: %v", err)
+	}
+
+	var signatureSet []*protoutil.SignedData
+	for _, metadataSignature := range metadata.Signatures {
+		sigHdr, err := protoutil.UnmarshalSignatureHeader(metadataSignature.SignatureHeader)
+		if err != nil {
+			return nil, errors.Errorf("failed unmarshalling signature header for block with id %d: %v",
+				block.Header.Number, err)
+		}
+		signatureSet = append(signatureSet,
+			&protoutil.SignedData{
+				Identity: sigHdr.Creator,
+				Data: util.ConcatenateBytes(metadata.Value,
+					metadataSignature.SignatureHeader, protoutil.BlockHeaderBytes(block.Header)),
+				Signature: metadataSignature.Signature,
+			},
+		)
+	}
+	return signatureSet, nil
+}
+
+// VerifyBlockSignature verifies the signature on the block with the given BlockVerifier and the given config.
+func VerifyBlockSignature(block *common.Block, verifier BlockVerifier, config *common.ConfigEnvelope) error {
+	signatureSet, err := SignatureSetFromBlock(block)
+	if err != nil {
+		return err
+	}
+	return verifier.VerifyBlockSignature(signatureSet, config)
 }
 
 // EndpointCriteria defines criteria of how to connect to a remote orderer node.
@@ -172,6 +366,58 @@ func globalEndpointsFromConfig(aggregatedTLSCerts [][]byte, bundle *channelconfi
 	return globalEndpoints
 }
 
+// BlockVerifierAssembler creates a BlockVerifier out of a config envelope
+type BlockVerifierAssembler struct {
+	Logger *flogging.FabricLogger
+	BCCSP  bccsp.BCCSP
+}
+
+// VerifierFromConfig creates a BlockVerifier from the given configuration.
+func (bva *BlockVerifierAssembler) VerifierFromConfig(configuration *common.ConfigEnvelope, channel string) (BlockVerifier, error) {
+	bundle, err := channelconfig.NewBundle(channel, configuration.Config, bva.BCCSP)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed extracting bundle from envelope")
+	}
+	policyMgr := bundle.PolicyManager()
+
+	return &BlockValidationPolicyVerifier{
+		Logger:    bva.Logger,
+		PolicyMgr: policyMgr,
+		Channel:   channel,
+		BCCSP:     bva.BCCSP,
+	}, nil
+}
+
+// BlockValidationPolicyVerifier verifies signatures based on the block validation policy.
+type BlockValidationPolicyVerifier struct {
+	Logger    *flogging.FabricLogger
+	Channel   string
+	PolicyMgr policies.Manager
+	BCCSP     bccsp.BCCSP
+}
+
+// VerifyBlockSignature verifies the signed data associated to a block, optionally with the given config envelope.
+func (bv *BlockValidationPolicyVerifier) VerifyBlockSignature(sd []*protoutil.SignedData, envelope *common.ConfigEnvelope) error {
+	policyMgr := bv.PolicyMgr
+	// If the envelope passed isn't nil, we should use a different policy manager.
+	if envelope != nil {
+		bundle, err := channelconfig.NewBundle(bv.Channel, envelope.Config, bv.BCCSP)
+		if err != nil {
+			buff := &bytes.Buffer{}
+			protolator.DeepMarshalJSON(buff, envelope.Config)
+			bv.Logger.Errorf("Failed creating a new bundle for channel %s, Config content is: %s", bv.Channel, buff.String())
+			return err
+		}
+		bv.Logger.Infof("Initializing new PolicyManager for channel %s", bv.Channel)
+		policyMgr = bundle.PolicyManager()
+	}
+	policy, exists := policyMgr.GetPolicy(policies.BlockValidation)
+	if !exists {
+		return errors.Errorf("policy %s wasn't found", policies.BlockValidation)
+	}
+	return policy.EvaluateSignedData(sd)
+}
+
 // ErrSkipped denotes that replicating a chain was skipped
 var ErrSkipped = errors.New("skipped")
 
@@ -270,6 +516,33 @@ func EndpointconfigFromConfigBlockV3(block *common.Block) ([]EndpointCriteria, e
 	ordererGrp := configEnv.Config.ChannelGroup.Groups[channelconfig.OrdererGroupKey].Groups
 
 	return perOrgEndpointsByMSPID(ordererGrp)
+}
+
+func BlockVerifierBuilder(bccsp bccsp.BCCSP) func(block *common.Block) protoutil.BlockVerifierFunc {
+	return func(block *common.Block) protoutil.BlockVerifierFunc {
+		bundle, err := bundleFromConfigBlock(block, bccsp)
+		if err != nil {
+			return createErrorFunc(err)
+		}
+
+		policy, exists := bundle.PolicyManager().GetPolicy(policies.BlockValidation)
+		if !exists {
+			return createErrorFunc(errors.New("no policies in config block"))
+		}
+
+		bftEnabled := bundle.ChannelConfig().Capabilities().ConsensusTypeBFT()
+
+		var consenters []*common.Consenter
+		if bftEnabled {
+			cfg, ok := bundle.OrdererConfig()
+			if !ok {
+				return createErrorFunc(errors.New("no orderer section in config block"))
+			}
+			consenters = cfg.Consenters()
+		}
+
+		return protoutil.BlockSignatureVerifier(bftEnabled, consenters, policy)
+	}
 }
 
 func createErrorFunc(err error) protoutil.BlockVerifierFunc {

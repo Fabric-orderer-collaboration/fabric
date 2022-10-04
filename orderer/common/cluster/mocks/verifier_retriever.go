@@ -3,7 +3,7 @@
 package mocks
 
 import (
-	cluster "github.com/hyperledger/fabric/orderer/common/cluster"
+	"github.com/hyperledger/fabric/common/replication"
 	mock "github.com/stretchr/testify/mock"
 )
 
@@ -13,15 +13,15 @@ type VerifierRetriever struct {
 }
 
 // RetrieveVerifier provides a mock function with given fields: channel
-func (_m *VerifierRetriever) RetrieveVerifier(channel string) cluster.BlockVerifier {
+func (_m *VerifierRetriever) RetrieveVerifier(channel string) replication.BlockVerifier {
 	ret := _m.Called(channel)
 
-	var r0 cluster.BlockVerifier
-	if rf, ok := ret.Get(0).(func(string) cluster.BlockVerifier); ok {
+	var r0 replication.BlockVerifier
+	if rf, ok := ret.Get(0).(func(string) replication.BlockVerifier); ok {
 		r0 = rf(channel)
 	} else {
 		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(cluster.BlockVerifier)
+			r0 = ret.Get(0).(replication.BlockVerifier)
 		}
 	}
 

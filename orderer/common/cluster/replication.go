@@ -353,7 +353,7 @@ type PullerConfig struct {
 // VerifierRetriever retrieves BlockVerifiers for channels.
 type VerifierRetriever interface {
 	// RetrieveVerifier retrieves a BlockVerifier for the given channel.
-	RetrieveVerifier(channel string) BlockVerifier
+	RetrieveVerifier(channel string) replication.BlockVerifier
 }
 
 // BlockPullerFromConfigBlock returns a BlockPuller that doesn't verify signatures on blocks.
@@ -395,7 +395,7 @@ func BlockPullerFromConfigBlock(conf PullerConfig, block *common.Block, verifier
 			if verifier == nil {
 				return errors.Errorf("couldn't acquire verifier for channel %s", channel)
 			}
-			return VerifyBlocks(blocks, verifier)
+			return replication.VerifyBlocks(blocks, verifier)
 		},
 		MaxTotalBufferBytes: conf.MaxTotalBufferBytes,
 		Endpoints:           endpoints,
@@ -583,7 +583,7 @@ func (ci *ChainInspector) Channels() []ChannelGenesisBlock {
 	// We don't need to verify the entire chain of all blocks we pulled,
 	// because the block puller calls VerifyBlockHash on all blocks it pulls.
 	last2Blocks := []*common.Block{block, ci.LastConfigBlock}
-	if err := VerifyBlockHash(1, last2Blocks); err != nil {
+	if err := replication.VerifyBlockHash(1, last2Blocks); err != nil {
 		ci.Logger.Panic("System channel pulled doesn't match the boot last config block:", err)
 	}
 

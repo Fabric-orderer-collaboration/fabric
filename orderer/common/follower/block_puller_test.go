@@ -18,12 +18,12 @@ import (
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/common/crypto/tlsgen"
+	"github.com/hyperledger/fabric/common/replication"
 	"github.com/hyperledger/fabric/core/config/configtest"
 	"github.com/hyperledger/fabric/internal/configtxgen/encoder"
 	"github.com/hyperledger/fabric/internal/configtxgen/genesisconfig"
 	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
-	"github.com/hyperledger/fabric/orderer/common/cluster"
 	"github.com/hyperledger/fabric/orderer/common/follower"
 	"github.com/hyperledger/fabric/orderer/common/follower/mocks"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
@@ -39,11 +39,11 @@ type signerSerializer interface {
 }
 
 var (
-	channelID  string
-	mockSigner *mocks.SignerSerializer
-	tlsCA      tlsgen.CA
-	dialer     *cluster.PredicateDialer
-	cryptoProv bccsp.BCCSP
+	channelID    string
+	mockSigner   *mocks.SignerSerializer
+	tlsCA        tlsgen.CA
+	dialerConfig comm.ClientConfig
+	cryptoProv   bccsp.BCCSP
 )
 
 func setupBlockPullerTest(t *testing.T) {
@@ -53,11 +53,9 @@ func setupBlockPullerTest(t *testing.T) {
 	var err error
 	tlsCA, err = tlsgen.NewCA()
 	require.NoError(t, err)
-	dialer = &cluster.PredicateDialer{
-		Config: comm.ClientConfig{
-			SecOpts: comm.SecureOptions{
-				Certificate: tlsCA.CertBytes(),
-			},
+	dialerConfig = comm.ClientConfig{
+		SecOpts: comm.SecureOptions{
+			Certificate: tlsCA.CertBytes(),
 		},
 	}
 
@@ -69,22 +67,17 @@ func TestNewBlockPullerFactory(t *testing.T) {
 	setupBlockPullerTest(t)
 
 	t.Run("good", func(t *testing.T) {
-		bpf, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, dialer, localconfig.Cluster{}, cryptoProv)
+		bpf, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, dialerConfig, localconfig.Cluster{}, cryptoProv)
 		require.NoError(t, err)
 		require.NotNil(t, bpf)
 	})
 
-	t.Run("dialer is nil", func(t *testing.T) {
-		require.Panics(t, func() {
-			follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, nil, localconfig.Cluster{}, cryptoProv)
-		})
-	})
-
 	t.Run("dialer has bad cert", func(t *testing.T) {
-		badDialer := &cluster.PredicateDialer{
-			Config: dialer.Config,
+		badDialer := comm.ClientConfig{
+			SecOpts: comm.SecureOptions{
+				Certificate: []byte("not-a-certificate"),
+			},
 		}
-		badDialer.Config.SecOpts.Certificate = []byte("not-a-certificate")
 		bpf, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, badDialer, localconfig.Cluster{}, cryptoProv)
 		require.EqualError(t, err, "client certificate isn't in PEM format: not-a-certificate")
 		require.Nil(t, bpf)
@@ -94,7 +87,7 @@ func TestNewBlockPullerFactory(t *testing.T) {
 func TestBlockPullerFactory_BlockPuller(t *testing.T) {
 	setupBlockPullerTest(t)
 
-	factory, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, dialer, localconfig.Cluster{}, cryptoProv)
+	factory, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, dialerConfig, localconfig.Cluster{}, cryptoProv)
 	require.NotNil(t, factory)
 	require.NoError(t, err)
 
@@ -108,7 +101,7 @@ func TestBlockPullerFactory_BlockPuller(t *testing.T) {
 
 	t.Run("bad join block", func(t *testing.T) {
 		bp, err := factory.BlockPuller(&cb.Block{Header: &cb.BlockHeader{}}, make(chan struct{}))
-		require.EqualError(t, err, "error extracting endpoints from config block: block data is nil")
+		require.EqualError(t, err, "block data is nil")
 		require.Nil(t, bp)
 	})
 }
@@ -116,7 +109,7 @@ func TestBlockPullerFactory_BlockPuller(t *testing.T) {
 func TestBlockPullerFactory_VerifyBlockSequence(t *testing.T) {
 	// replaces cluster.VerifyBlocks, count blocks
 	var numBlocks int32
-	altVerifyBlocks := func(blockBuff []*cb.Block, signatureVerifier cluster.BlockVerifier) error { // replaces cluster.VerifyBlocks, count invocations
+	altVerifyBlocks := func(blockBuff []*cb.Block, signatureVerifier replication.BlockVerifier) error { // replaces cluster.VerifyBlocks, count invocations
 		if len(blockBuff) == 0 {
 			return errors.New("buffer is empty")
 		}
@@ -129,7 +122,7 @@ func TestBlockPullerFactory_VerifyBlockSequence(t *testing.T) {
 	t.Run("skip genesis block, alone", func(t *testing.T) {
 		setupBlockPullerTest(t)
 		atomic.StoreInt32(&numBlocks, 0)
-		creator, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, dialer, localconfig.Cluster{}, cryptoProv)
+		creator, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, dialerConfig, localconfig.Cluster{}, cryptoProv)
 		require.NotNil(t, creator)
 		require.NoError(t, err)
 		creator.ClusterVerifyBlocks = altVerifyBlocks
@@ -145,7 +138,7 @@ func TestBlockPullerFactory_VerifyBlockSequence(t *testing.T) {
 	t.Run("skip genesis block as part of a slice", func(t *testing.T) {
 		setupBlockPullerTest(t)
 		atomic.StoreInt32(&numBlocks, 0)
-		creator, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, dialer, localconfig.Cluster{}, cryptoProv)
+		creator, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, dialerConfig, localconfig.Cluster{}, cryptoProv)
 		require.NotNil(t, creator)
 		require.NoError(t, err)
 		creator.ClusterVerifyBlocks = altVerifyBlocks
@@ -163,7 +156,7 @@ func TestBlockPullerFactory_VerifyBlockSequence(t *testing.T) {
 	t.Run("verify all blocks in slice", func(t *testing.T) {
 		setupBlockPullerTest(t)
 		atomic.StoreInt32(&numBlocks, 0)
-		creator, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, dialer, localconfig.Cluster{}, cryptoProv)
+		creator, err := follower.NewBlockPullerCreator(channelID, testLogger, mockSigner, dialerConfig, localconfig.Cluster{}, cryptoProv)
 		require.NotNil(t, creator)
 		require.NoError(t, err)
 		creator.ClusterVerifyBlocks = altVerifyBlocks

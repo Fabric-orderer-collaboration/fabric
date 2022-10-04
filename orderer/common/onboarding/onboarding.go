@@ -18,6 +18,7 @@ import (
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/ledger/blockledger"
+	"github.com/hyperledger/fabric/common/replication"
 	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/orderer/common/cluster"
@@ -58,7 +59,7 @@ func NewReplicationInitiator(
 	logger := flogging.MustGetLogger("orderer.common.cluster")
 
 	vl := &verifierLoader{
-		verifierFactory: &cluster.BlockVerifierAssembler{Logger: logger, BCCSP: bccsp},
+		verifierFactory: &replication.BlockVerifierAssembler{Logger: logger, BCCSP: bccsp},
 		onFailure: func(block *common.Block) {
 			protolator.DeepMarshalJSON(os.Stdout, block)
 		},
@@ -80,7 +81,7 @@ func NewReplicationInitiator(
 		LoadVerifier:       vl.loadVerifier,
 		Logger:             logger,
 		VerifiersByChannel: verifiersByChannel,
-		VerifierFactory:    &cluster.BlockVerifierAssembler{Logger: logger, BCCSP: bccsp},
+		VerifierFactory:    &replication.BlockVerifierAssembler{Logger: logger, BCCSP: bccsp},
 	}
 
 	ledgerFactory := &ledgerFactory{
@@ -349,12 +350,12 @@ func (bg *blockGetter) Block(number uint64) *common.Block {
 
 type verifierLoader struct {
 	ledgerFactory   blockledger.Factory
-	verifierFactory cluster.VerifierFactory
+	verifierFactory replication.VerifierFactory
 	logger          *flogging.FabricLogger
 	onFailure       func(block *common.Block)
 }
 
-type verifiersByChannel map[string]cluster.BlockVerifier
+type verifiersByChannel map[string]replication.BlockVerifier
 
 func (vl *verifierLoader) loadVerifiers() verifiersByChannel {
 	res := make(verifiersByChannel)
@@ -370,7 +371,7 @@ func (vl *verifierLoader) loadVerifiers() verifiersByChannel {
 	return res
 }
 
-func (vl *verifierLoader) loadVerifier(chain string) cluster.BlockVerifier {
+func (vl *verifierLoader) loadVerifier(chain string) replication.BlockVerifier {
 	ledger, err := vl.ledgerFactory.GetOrCreate(chain)
 	if err != nil {
 		vl.logger.Panicf("Failed obtaining ledger for channel %s", chain)
@@ -392,7 +393,7 @@ func (vl *verifierLoader) loadVerifier(chain string) cluster.BlockVerifier {
 	if err != nil {
 		vl.logger.Panicf("Failed retrieving config block [%d] for channel %s", lastBlockIndex, chain)
 	}
-	conf, err := cluster.ConfigFromBlock(lastConfigBlock)
+	conf, err := replication.ConfigFromBlock(lastConfigBlock)
 	if err != nil {
 		vl.onFailure(lastConfigBlock)
 		vl.logger.Panicf("Failed extracting configuration for channel %s from block [%d]: %v",

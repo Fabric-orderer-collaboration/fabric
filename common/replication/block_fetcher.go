@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"reflect"
 	"sync"
@@ -17,8 +18,10 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/util"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
@@ -31,6 +34,8 @@ const (
 	ShuffleSource BlockSourceOp = iota
 	CurrentSource
 )
+
+var logger = flogging.MustGetLogger("replication")
 
 //go:generate mockery -dir . -name BlockSource -case underscore -output mocks/
 
@@ -260,10 +265,12 @@ type FetcherConfig struct {
 	TLSCert                      []byte
 	Endpoints                    []EndpointCriteria
 	FetchTimeout                 time.Duration
+	RetryTimeout                 time.Duration
 	CensorshipSuspicionThreshold time.Duration
 	PeriodicalShuffleInterval    time.Duration
 	MaxRetries                   uint64
 	MaxByzantineNodes            int
+	BufferSize                   int
 }
 
 // UpdateFetcherConfigFromConfigBlock updates the endpoints in fetcherconfig from a config block.
@@ -304,6 +311,113 @@ type BlockFetcher struct {
 	currentBlockSource      BlockSource
 	suspects                suspectSet // a set of bft suspected nodes.
 	setupVerifierInProgress bool
+}
+
+func NewBlockFetcher(fc FetcherConfig, signer identity.SignerSerializer, bccsp bccsp.BCCSP, lastConfigBlock *common.Block, dialerConfig comm.ClientConfig, verifyBlockSequence func(blocks []*common.Block, _ string) error, stopChannel chan struct{}) (*BlockFetcher, error) {
+	// Extract the TLS CA certs and endpoints from the configuration,
+	var err error
+	fc.Endpoints, err = EndpointconfigFromConfigBlock(lastConfigBlock, bccsp)
+	if err != nil {
+		return nil, err
+	}
+
+	der, _ := pem.Decode(dialerConfig.SecOpts.Certificate)
+	if der == nil {
+		return nil, errors.Errorf("client certificate isn't in PEM format: %v",
+			string(dialerConfig.SecOpts.Certificate))
+	}
+	fc.TLSCert = der.Bytes
+
+	stdDialer := &StandardDialer{
+		Config: dialerConfig,
+	}
+	stdDialer.Config.AsyncConnect = false
+	stdDialer.Config.SecOpts.VerifyCertificate = nil
+
+	bf_logger := flogging.MustGetLogger("common.replication.puller").With("channel", fc.Channel)
+
+	// modify the verifier builder with middleware to skip verifying the genesis block
+	// in the follower chain
+	modifiedVerifierBuilder := func(blockVerifierFunction protoutil.BlockVerifierFunc) protoutil.BlockVerifierFunc {
+		return protoutil.BlockVerifierFunc(
+			func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+				// don't verify the genesis block
+				if header.Number == 0 {
+					bf_logger.Debugf("Not verfying genesis block for follower chain")
+					return nil
+				}
+
+				return blockVerifierFunction(header, metadata)
+			})
+	}
+
+	// wrap the verifier factory to stop verifying genesis block
+	verifierFactory := func(block *common.Block) protoutil.BlockVerifierFunc {
+		vf := BlockVerifierBuilder(bccsp)
+		return modifiedVerifierBuilder(vf(block))
+	}
+
+	// To tolerate byzantine behaviour of `f` faulty nodes, we need atleast of `3f + 1` nodes.
+	// check for bft enable and update `MaxByzantineNodes`
+	// accordingly.
+	bftEnabled, f, err := BFTEnabledInConfig(lastConfigBlock, bccsp)
+	if err != nil {
+		return nil, err
+	}
+
+	var verifyBlockFunc protoutil.BlockVerifierFunc
+	if bftEnabled && f > 0 {
+		fc.MaxByzantineNodes = f
+		// setting verifyBlockFunc, will make BlockFetcher pull genesis block in a bft setting and
+		// intialize the VerifyBlock function
+		verifyBlockFunc = nil
+	} else {
+		verifyBlockFunc = verifierFactory(lastConfigBlock)
+	}
+
+	bf := &BlockFetcher{
+		FetcherConfig:        fc,
+		LastConfigBlock:      lastConfigBlock,
+		BlockVerifierFactory: verifierFactory,
+		VerifyBlock:          verifyBlockFunc,
+		AttestationSourceFactory: func(c FetcherConfig, latestConfigBlock *common.Block) (AttestationSource, error) {
+			fc, err := UpdateFetcherConfigFromConfigBlock(c, latestConfigBlock)
+			if err != nil {
+				bf_logger.Errorf("Could not update FetcherConfig fom Config Block: %v", err)
+			}
+			return &AttestationPuller{
+				Config: fc,
+				Signer: signer,
+				Dialer: stdDialer,
+				Logger: flogging.MustGetLogger("orderer.common.cluster.attestationpuller").With("channel", fc.Channel),
+			}, err
+		},
+		BlockSourceFactory: func(c FetcherConfig, latestConfigBlock *common.Block) (BlockSource, error) {
+			// update FetcherConfig from latestConfigBlock
+			fc, err := UpdateFetcherConfigFromConfigBlock(c, latestConfigBlock)
+			if err != nil {
+				bf_logger.Errorf("Could not update FetcherConfig fom Config Block: %v", err)
+			}
+			return &BlockPuller{
+				VerifyBlockSequence: verifyBlockSequence,
+				Logger:              flogging.MustGetLogger("orderer.common.cluster.puller").With("channel", fc.Channel),
+				RetryTimeout:        fc.RetryTimeout,
+				MaxTotalBufferBytes: fc.BufferSize,
+				FetchTimeout:        fc.FetchTimeout,
+				Endpoints:           fc.Endpoints,
+				Signer:              signer,
+				TLSCert:             fc.TLSCert,
+				Channel:             fc.Channel,
+				Dialer:              stdDialer,
+				StopChannel:         stopChannel,
+			}, err
+		},
+		Logger:  bf_logger,
+		Signer:  signer,
+		Dialer:  stdDialer,
+		TimeNow: time.Now,
+	}
+	return bf, nil
 }
 
 func (bf *BlockFetcher) getBlockSource() (BlockSource, error) {
