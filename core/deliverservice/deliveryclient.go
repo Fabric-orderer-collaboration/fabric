@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/bccsp"
@@ -21,7 +20,6 @@ import (
 	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/internal/pkg/peer/blocksprovider"
-	"github.com/hyperledger/fabric/internal/pkg/peer/orderers"
 	"google.golang.org/grpc"
 )
 
@@ -53,9 +51,10 @@ type deliverServiceImpl struct {
 	stopping       bool
 }
 
-type CapabilityProvider interface {
+type ConfigProvider interface {
 	// Capabilities defines the capabilities for the application portion of this channel
 	Capabilities() channelconfig.ApplicationCapabilities
+	// Resources provide the config resource bundle
 	Resources() channelconfig.Resources
 }
 
@@ -64,21 +63,15 @@ type CapabilityProvider interface {
 // how it verifies messages received from it,
 // and how it disseminates the messages to other peers
 type Config struct {
-	IsStaticLeader bool
-	// CryptoSvc performs cryptographic actions like message verification and signing
-	// and identity validation.
-	CryptoSvc blocksprovider.BlockVerifier
 	// Gossip enables to enumerate peers in the channel, send a message to peers,
 	// and add a block to the gossip state transfer layer.
 	Gossip blocksprovider.GossipServiceAdapter
-	// OrdererSource provides orderer endpoints, complete with TLS cert pools.
-	OrdererSource *orderers.ConnectionSource
 	// Signer is the identity used to sign requests.
 	Signer identity.SignerSerializer
 	// DeliverServiceConfig is the configuration object.
 	DeliverServiceConfig *DeliverServiceConfig
 	BCCSP                bccsp.BCCSP
-	CapabilityProvider   CapabilityProvider
+	ConfigProvider       ConfigProvider
 }
 
 // NewDeliverService construction function to create and initialize
@@ -129,34 +122,19 @@ func (d *deliverServiceImpl) StartDeliverForChannel(chainID string, ledgerInfo b
 	logger.Info("This peer will retrieve blocks from ordering service and disseminate to other peers in the organization for channel", chainID)
 
 	dc := &blocksprovider.Deliverer{
-		ChannelID:     chainID,
-		Gossip:        d.conf.Gossip,
-		Ledger:        ledgerInfo,
-		BlockVerifier: d.conf.CryptoSvc,
-		Dialer: DialerAdapter{
-			ClientConfig: comm.ClientConfig{
-				DialTimeout: d.conf.DeliverServiceConfig.ConnectionTimeout,
-				KaOpts:      d.conf.DeliverServiceConfig.KeepaliveOptions,
-				SecOpts:     d.conf.DeliverServiceConfig.SecOpts,
-			},
-		},
+		ChannelID: chainID,
+		Gossip:    d.conf.Gossip,
+		Ledger:    ledgerInfo,
 		ClientConfig: comm.ClientConfig{
 			DialTimeout: d.conf.DeliverServiceConfig.ConnectionTimeout,
 			KaOpts:      d.conf.DeliverServiceConfig.KeepaliveOptions,
 			SecOpts:     d.conf.DeliverServiceConfig.SecOpts,
 		},
-		BCCSP:               d.conf.BCCSP,
-		Orderers:            d.conf.OrdererSource,
-		DoneC:               make(chan struct{}),
-		Signer:              d.conf.Signer,
-		ResourceProvider:    d.conf.CapabilityProvider,
-		DeliverStreamer:     DeliverAdapter{},
-		Logger:              flogging.MustGetLogger("peer.blocksprovider").With("channel", chainID),
-		MaxRetryDelay:       d.conf.DeliverServiceConfig.ReConnectBackoffThreshold,
-		MaxRetryDuration:    d.conf.DeliverServiceConfig.ReconnectTotalTimeThreshold,
-		BlockGossipDisabled: !d.conf.DeliverServiceConfig.BlockGossipEnabled,
-		InitialRetryDelay:   100 * time.Millisecond,
-		YieldLeadership:     !d.conf.IsStaticLeader,
+		BCCSP:          d.conf.BCCSP,
+		DoneC:          make(chan struct{}),
+		Signer:         d.conf.Signer,
+		ConfigProvider: d.conf.ConfigProvider,
+		Logger:         flogging.MustGetLogger("peer.blocksprovider").With("channel", chainID),
 	}
 
 	if d.conf.DeliverServiceConfig.SecOpts.RequireClientCert {

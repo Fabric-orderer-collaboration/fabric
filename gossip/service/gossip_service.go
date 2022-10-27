@@ -138,14 +138,11 @@ type deliveryFactoryImpl struct {
 // Returns an instance of delivery client
 func (df *deliveryFactoryImpl) Service(g GossipServiceAdapter, ordererSource *orderers.ConnectionSource, mcs api.MessageCryptoService, isStaticLeader bool, bccsp bccsp.BCCSP, provider CapabilityProvider) deliverservice.DeliverService {
 	return deliverservice.NewDeliverService(&deliverservice.Config{
-		IsStaticLeader:       isStaticLeader,
-		CryptoSvc:            mcs,
 		Gossip:               g,
 		Signer:               df.signer,
 		DeliverServiceConfig: df.deliverServiceConfig,
-		OrdererSource:        ordererSource,
 		BCCSP:                bccsp,
-		CapabilityProvider:   provider,
+		ConfigProvider:       provider,
 	})
 }
 

@@ -959,7 +959,7 @@ func newAttestationPuller(dialer *countingDialer, orderers ...string) *replicati
 		Logger: flogging.MustGetLogger("test"),
 		Config: replication.FetcherConfig{
 			Channel:      "mychannel",
-			TLSCert:      []byte{},
+			TLSCertHash:  []byte{},
 			Endpoints:    endpointCriteriaFromEndpoints(orderers...),
 			FetchTimeout: time.Second * 10,
 		},

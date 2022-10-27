@@ -18,7 +18,6 @@ import (
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
@@ -32,7 +31,7 @@ type BlockPuller struct {
 	MaxPullBlockRetries uint64
 	MaxTotalBufferBytes int
 	Signer              identity.SignerSerializer
-	TLSCert             []byte
+	TLSCertHash         []byte
 	Channel             string
 	FetchTimeout        time.Duration
 	RetryTimeout        time.Duration
@@ -241,7 +240,7 @@ func (p *BlockPuller) pullBlocks(seq uint64, reConnected bool) error {
 func (p *BlockPuller) obtainStream(reConnected bool, env *common.Envelope, seq uint64) (*ImpatientStream, error) {
 	var stream *ImpatientStream
 	var err error
-	if reConnected {
+	if reConnected || p.stream == nil {
 		p.Logger.Infof("Sending request for block [%d] to %s", seq, p.endpoint)
 		stream, err = p.requestBlocks(p.endpoint, NewImpatientStream(p.conn, p.FetchTimeout), env)
 		if err != nil {
@@ -478,7 +477,7 @@ func (p *BlockPuller) seekLastEnvelope() (*common.Envelope, error) {
 		last(),
 		int32(0),
 		uint64(0),
-		util.ComputeSHA256(p.TLSCert),
+		p.TLSCertHash,
 	)
 }
 
@@ -490,7 +489,7 @@ func (p *BlockPuller) seekNextEnvelope(startSeq uint64) (*common.Envelope, error
 		nextSeekInfo(startSeq),
 		int32(0),
 		uint64(0),
-		util.ComputeSHA256(p.TLSCert),
+		p.TLSCertHash,
 	)
 }
 

@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"encoding/pem"
 	"fmt"
 	"reflect"
 	"sync"
@@ -21,7 +20,6 @@ import (
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/protoutil"
@@ -105,7 +103,7 @@ func (p *AttestationPuller) seekNextEnvelope(startSeq uint64) (*common.Envelope,
 		nextSeekInfo(startSeq),
 		int32(0),
 		uint64(0),
-		util.ComputeSHA256(p.Config.TLSCert),
+		p.Config.TLSCertHash,
 	)
 }
 
@@ -263,7 +261,7 @@ func newImpatientStream(conn *grpc.ClientConn, waitTimeout time.Duration, env *c
 // FetcherConfig stores the configuration parameters needed to create a BlockFetcher
 type FetcherConfig struct {
 	Channel                      string
-	TLSCert                      []byte
+	TLSCertHash                  []byte
 	Endpoints                    []EndpointCriteria
 	FetchTimeout                 time.Duration
 	RetryTimeout                 time.Duration
@@ -279,7 +277,7 @@ type FetcherConfig struct {
 // the error returned may be logged.
 func UpdateFetcherConfigFromConfigBlock(c FetcherConfig, latestConfig channelconfig.Resources) (FetcherConfig, error) {
 	fetcherConfig := c
-	endpoints, err := EndpointconfigFromConfig(latestConfig)
+	endpoints, err := EndpointsFromConfig(latestConfig)
 
 	if err == nil {
 		// update endpoints from config block
@@ -316,32 +314,20 @@ type BlockFetcher struct {
 	setupVerifierInProgress bool
 }
 
-func NewBlockFetcher(fc FetcherConfig, signer identity.SignerSerializer, bccsp bccsp.BCCSP, lastConfig channelconfig.Resources, dialerConfig comm.ClientConfig, verifyBlockSequence func(blocks []*common.Block, _ string) error, stopChannel chan struct{}) (*BlockFetcher, error) {
-	// Extract the TLS CA certs and endpoints from the configuration,
-	// bundle, err := BundleFromConfigBlock(lastConfigBlock, bccsp)
-	// if err != nil {
-	// 	return nil, err
-	// }
+func NewBlockFetcher(fc FetcherConfig, signer identity.SignerSerializer, bccsp bccsp.BCCSP, lastConfig channelconfig.Resources, dialerConfig comm.ClientConfig, verifyBlockSequence BlockSequenceVerifier, stopChannel chan struct{}) (*BlockFetcher, error) {
 	var err error
-	fc.Endpoints, err = EndpointconfigFromConfig(lastConfig)
+	fc.Endpoints, err = EndpointsFromConfig(lastConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	der, _ := pem.Decode(dialerConfig.SecOpts.Certificate)
-	if der == nil {
-		return nil, errors.Errorf("client certificate isn't in PEM format: %v",
-			string(dialerConfig.SecOpts.Certificate))
-	}
-	fc.TLSCert = der.Bytes
+	bf_logger := flogging.MustGetLogger("common.replication.puller").With("channel", fc.Channel)
 
 	stdDialer := &StandardDialer{
 		Config: dialerConfig,
 	}
 	stdDialer.Config.AsyncConnect = false
 	stdDialer.Config.SecOpts.VerifyCertificate = nil
-
-	bf_logger := flogging.MustGetLogger("common.replication.puller").With("channel", fc.Channel)
 
 	// modify the verifier builder with middleware to skip verifying the genesis block
 	// in the follower chain
@@ -396,7 +382,7 @@ func NewBlockFetcher(fc FetcherConfig, signer identity.SignerSerializer, bccsp b
 				Config: fc,
 				Signer: signer,
 				Dialer: stdDialer,
-				Logger: flogging.MustGetLogger("orderer.common.cluster.attestationpuller").With("channel", fc.Channel),
+				Logger: flogging.MustGetLogger("common.replication.attestationpuller").With("channel", fc.Channel),
 			}, err
 		},
 		BlockSourceFactory: func(c FetcherConfig, latestConfig channelconfig.Resources) (BlockSource, error) {
@@ -405,15 +391,17 @@ func NewBlockFetcher(fc FetcherConfig, signer identity.SignerSerializer, bccsp b
 			if err != nil {
 				bf_logger.Errorf("Could not update FetcherConfig fom Config Block: %v", err)
 			}
+
 			return &BlockPuller{
 				VerifyBlockSequence: verifyBlockSequence,
-				Logger:              flogging.MustGetLogger("orderer.common.cluster.puller").With("channel", fc.Channel),
+				Logger:              flogging.MustGetLogger("common.replication.puller").With("channel", fc.Channel),
 				RetryTimeout:        fc.RetryTimeout,
 				MaxTotalBufferBytes: fc.BufferSize,
 				FetchTimeout:        fc.FetchTimeout,
+				MaxPullBlockRetries: fc.MaxRetries,
 				Endpoints:           fc.Endpoints,
 				Signer:              signer,
-				TLSCert:             fc.TLSCert,
+				TLSCertHash:         fc.TLSCertHash,
 				Channel:             fc.Channel,
 				Dialer:              stdDialer,
 				StopChannel:         stopChannel,
@@ -483,7 +471,7 @@ func (bf *BlockFetcher) maybeUpdateLatestConfigBlock(block *common.Block) {
 		bf.Logger.Infof("Config block %d received is later than last config block %d, updating its reference", seq, bf.ConfigSequence)
 		bf.ConfigSequence = seq
 		bf.LastConfig = bundle
-		endpoints, err := EndpointconfigFromConfig(bundle)
+		endpoints, err := EndpointsFromConfig(bundle)
 		if err != nil {
 			bf.Logger.Errorf("Failed parsing orderer endpoints from block %d: %v", block.Header.Number, err)
 			return
@@ -505,14 +493,19 @@ func (bf *BlockFetcher) shuffleEndpoint() error {
 	bf.Logger.Debugf("Shuffled block puller endpoint. New endpoint: [%s]", bf.currentEndpoint)
 	err := bf.setBlockSource(bf.currentEndpoint)
 	bf.lastShuffledAt = bf.TimeNow()
+	bf.blockSourceOp = CurrentSource
 	return err
 }
 
 func (bf *BlockFetcher) blockSourceCandidates() []EndpointCriteria {
 	var candidates []EndpointCriteria
+	if len(bf.Endpoints) == 1 {
+		return bf.Endpoints
+	}
 	for _, e := range bf.Endpoints {
 		// If candidate is suspected to be censoring,
 		// or if it's the previous endpoint, don't pick it.
+		logger.Warnw("blockSourceCandidates", "e", e, "suspects", bf.suspects, "current", bf.currentEndpoint)
 		if bf.suspects.has(e.Endpoint) || e.Endpoint == bf.currentEndpoint.Endpoint {
 			continue
 		}
@@ -647,6 +640,10 @@ func (bf *BlockFetcher) setUpVerifierFromGenesisBlock() bool {
 			defer blockSource.Close()
 
 			block := blockSource.PullBlock(0)
+			if block == nil {
+				bf.Logger.Warn("*** nil block")
+				return
+			}
 			// verify data hash on the block
 			if !bytes.Equal(protoutil.BlockDataHash(block.Data), block.Header.DataHash) {
 				bf.Logger.Warnf("Block data hash mismatch on block %d", block.Header.Number)

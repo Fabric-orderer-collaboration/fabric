@@ -17,6 +17,7 @@ import (
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/replication"
+	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
@@ -367,7 +368,7 @@ func BlockPullerFromConfigBlock(conf PullerConfig, block *common.Block, verifier
 		return nil, err
 	}
 
-	endpoints, err := replication.EndpointconfigFromConfig(bundle)
+	endpoints, err := replication.EndpointsFromConfig(bundle)
 	if err != nil {
 		return nil, err
 	}
@@ -392,9 +393,9 @@ func BlockPullerFromConfigBlock(conf PullerConfig, block *common.Block, verifier
 	}
 
 	return &replication.BlockPuller{
-		Logger:  flogging.MustGetLogger("orderer.common.cluster.replication").With("channel", conf.Channel),
-		Dialer:  dialer,
-		TLSCert: tlsCertAsDER.Bytes,
+		Logger:      flogging.MustGetLogger("orderer.common.cluster.replication").With("channel", conf.Channel),
+		Dialer:      dialer,
+		TLSCertHash: util.ComputeSHA256(tlsCertAsDER.Bytes),
 		VerifyBlockSequence: func(blocks []*common.Block, channel string) error {
 			verifier := verifierRetriever.RetrieveVerifier(channel)
 			if verifier == nil {

@@ -307,9 +307,9 @@ func (ep EndpointCriteria) String() string {
 // 	return EndpointconfigFromConfig(bundle)
 // }
 
-// EndpointconfigFromConfig retrieves TLS CA certificates and endpoints
+// EndpointsFromConfig retrieves TLS CA certificates and endpoints
 // from a config block.
-func EndpointconfigFromConfig(resources channelconfig.Resources) ([]EndpointCriteria, error) {
+func EndpointsFromConfig(resources channelconfig.Resources) ([]EndpointCriteria, error) {
 	msps, err := resources.MSPManager().GetMSPs()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed obtaining MSPs from MSPManager")
