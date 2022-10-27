@@ -18,6 +18,7 @@ import (
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/peer"
 	transientstore2 "github.com/hyperledger/fabric-protos-go/transientstore"
+	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/bccsp/factory"
 	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/common/channelconfig"
@@ -381,7 +382,7 @@ type mockDeliverServiceFactory struct {
 	service *mockDeliverService
 }
 
-func (mf *mockDeliverServiceFactory) Service(GossipServiceAdapter, *orderers.ConnectionSource, api.MessageCryptoService, bool) deliverservice.DeliverService {
+func (mf *mockDeliverServiceFactory) Service(GossipServiceAdapter, *orderers.ConnectionSource, api.MessageCryptoService, bool, bccsp.BCCSP, CapabilityProvider) deliverservice.DeliverService {
 	return mf.service
 }
 
@@ -907,7 +908,7 @@ func TestInvalidInitialization(t *testing.T) {
 	go grpcServer.Serve(socket)
 	defer grpcServer.Stop()
 
-	dc := gService.deliveryFactory.Service(gService, orderers.NewConnectionSource(flogging.MustGetLogger("peer.orderers"), nil), &naiveCryptoService{}, false)
+	dc := gService.deliveryFactory.Service(gService, orderers.NewConnectionSource(flogging.MustGetLogger("peer.orderers"), nil), &naiveCryptoService{}, false, nil, nil)
 	require.NotNil(t, dc)
 }
 

@@ -101,7 +101,7 @@ func TestBlockPullerFactory_BlockPuller(t *testing.T) {
 
 	t.Run("bad join block", func(t *testing.T) {
 		bp, err := factory.BlockPuller(&cb.Block{Header: &cb.BlockHeader{}}, make(chan struct{}))
-		require.EqualError(t, err, "block data is nil")
+		require.EqualError(t, err, "block contains no data")
 		require.Nil(t, bp)
 	})
 }

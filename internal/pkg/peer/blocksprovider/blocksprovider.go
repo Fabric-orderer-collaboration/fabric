@@ -14,8 +14,11 @@ import (
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/gossip"
 	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric/bccsp"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
 	gossipcommon "github.com/hyperledger/fabric/gossip/common"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/internal/pkg/peer/orderers"
 	"github.com/hyperledger/fabric/protoutil"
@@ -44,6 +47,7 @@ func (s sleeper) Sleep(d time.Duration, doneC chan struct{}) {
 
 // LedgerInfo an adapter to provide the interface to query
 // the ledger committer for current ledger height
+//
 //go:generate counterfeiter -o fake/ledger_info.go --fake-name LedgerInfo . LedgerInfo
 type LedgerInfo interface {
 	// LedgerHeight returns current local ledger height
@@ -52,6 +56,7 @@ type LedgerInfo interface {
 
 // GossipServiceAdapter serves to provide basic functionality
 // required from gossip service by delivery service
+//
 //go:generate counterfeiter -o fake/gossip_service_adapter.go --fake-name GossipServiceAdapter . GossipServiceAdapter
 type GossipServiceAdapter interface {
 	// AddPayload adds payload to the local state sync buffer
@@ -81,19 +86,28 @@ type DeliverStreamer interface {
 	Deliver(context.Context, *grpc.ClientConn) (orderer.AtomicBroadcast_DeliverClient, error)
 }
 
+type CapabilityProvider interface {
+	// Capabilities defines the capabilities for the application portion of this channel
+	Capabilities() channelconfig.ApplicationCapabilities
+	Resources() channelconfig.Resources
+}
+
 // Deliverer the actual implementation for BlocksProvider interface
 type Deliverer struct {
-	ChannelID       string
-	Gossip          GossipServiceAdapter
-	Ledger          LedgerInfo
-	BlockVerifier   BlockVerifier
-	Dialer          Dialer
-	Orderers        OrdererConnectionSource
-	DoneC           chan struct{}
-	Signer          identity.SignerSerializer
-	DeliverStreamer DeliverStreamer
-	Logger          *flogging.FabricLogger
-	YieldLeadership bool
+	ChannelID        string
+	Gossip           GossipServiceAdapter
+	Ledger           LedgerInfo
+	BlockVerifier    BlockVerifier
+	Dialer           Dialer
+	ClientConfig     comm.ClientConfig
+	Orderers         OrdererConnectionSource
+	DoneC            chan struct{}
+	Signer           identity.SignerSerializer
+	ResourceProvider CapabilityProvider
+	DeliverStreamer  DeliverStreamer
+	Logger           *flogging.FabricLogger
+	YieldLeadership  bool
+	BCCSP            bccsp.BCCSP
 
 	BlockGossipDisabled bool
 	MaxRetryDelay       time.Duration
@@ -111,11 +125,66 @@ const backoffExponentBase = 1.2
 // DeliverBlocks used to pull out blocks from the ordering service to
 // distributed them across peers
 func (d *Deliverer) DeliverBlocks() {
+	// This loops forever.
+
+	// replace with code that instantiates a common.replication.BlockPuller
+	// in a for loop, call PullBlock() followed by processMsg()
+
+	// delete all the orderer connection code since that's redundant
+
+	// endpoints, err := replication.EndpointconfigFromConfigBlock(configBlock, creator.bccsp)
+	// if err != nil {
+	// 	return nil, errors.WithMessage(err, "error extracting endpoints from config block")
+	// }
+
+	// fc := replication.FetcherConfig{
+	// 	Channel: d.ChannelID,
+
+	// }
+
+	// blockPuller := &replication.BlockFetcher{
+
+	// }
+
+	// block := blockPuller.PullBlock(ledgerHeight + 1)
+
+	// if it's a config block, wait until the block height has incremented before processing it
+	// so that any potential signature changes will have been committed.
+
 	if d.BlockGossipDisabled {
 		d.Logger.Infof("Will pull blocks without forwarding them to remote peers via gossip")
 	}
 	failureCounter := 0
 	totalDuration := time.Duration(0)
+
+	// fc := &replication.FetcherConfig{
+	// 	Channel: d.ChannelID,
+	// }
+
+	// ledgerHeight, err := d.Ledger.LedgerHeight()
+	// if err != nil {
+	// 	d.Logger.Error("Did not return ledger height, something is critically wrong", err)
+	// 	return
+	// }
+
+	// d.Logger.Warnw("**** DeliverBlocks", "ledgerHeight", ledgerHeight, "ClientConfig", d.ClientConfig)
+
+	// resources := d.ResourceProvider.Resources()
+
+	// lastConfigBlock := &common.Block{}
+
+	// verifyBlockSequence := func(blocks []*common.Block, _ string) error {
+	// 	return nil
+	// }
+
+	// _, err = replication.NewBlockFetcher(*fc, d.Signer, d.BCCSP, lastConfigBlock, d.ClientConfig, verifyBlockSequence, d.DoneC)
+	// if err != nil {
+	// 	d.Logger.Error("Upable to instantiate block fetcher, something is critically wrong", err)
+	// 	return
+	// }
+
+	// block := fetcher.PullBlock(ledgerHeight)
+	// d.Logger.Panicw("BlockFetcher returned block", "block", block)
 
 	// InitialRetryDelay * backoffExponentBase^n > MaxRetryDelay
 	// backoffExponentBase^n > MaxRetryDelay / InitialRetryDelay

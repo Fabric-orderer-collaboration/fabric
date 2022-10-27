@@ -12,6 +12,8 @@ import (
 
 	gproto "github.com/hyperledger/fabric-protos-go/gossip"
 	tspb "github.com/hyperledger/fabric-protos-go/transientstore"
+	"github.com/hyperledger/fabric/bccsp"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/committer"
 	"github.com/hyperledger/fabric/core/committer/txvalidator"
@@ -124,7 +126,7 @@ type GossipServiceAdapter interface {
 // DeliveryServiceFactory factory to create and initialize delivery service instance
 type DeliveryServiceFactory interface {
 	// Returns an instance of delivery client
-	Service(g GossipServiceAdapter, ordererSource *orderers.ConnectionSource, msc api.MessageCryptoService, isStaticLead bool) deliverservice.DeliverService
+	Service(g GossipServiceAdapter, ordererSource *orderers.ConnectionSource, msc api.MessageCryptoService, isStaticLead bool, bccsp bccsp.BCCSP, provider CapabilityProvider) deliverservice.DeliverService
 }
 
 type deliveryFactoryImpl struct {
@@ -134,7 +136,7 @@ type deliveryFactoryImpl struct {
 }
 
 // Returns an instance of delivery client
-func (df *deliveryFactoryImpl) Service(g GossipServiceAdapter, ordererSource *orderers.ConnectionSource, mcs api.MessageCryptoService, isStaticLeader bool) deliverservice.DeliverService {
+func (df *deliveryFactoryImpl) Service(g GossipServiceAdapter, ordererSource *orderers.ConnectionSource, mcs api.MessageCryptoService, isStaticLeader bool, bccsp bccsp.BCCSP, provider CapabilityProvider) deliverservice.DeliverService {
 	return deliverservice.NewDeliverService(&deliverservice.Config{
 		IsStaticLeader:       isStaticLeader,
 		CryptoSvc:            mcs,
@@ -142,6 +144,8 @@ func (df *deliveryFactoryImpl) Service(g GossipServiceAdapter, ordererSource *or
 		Signer:               df.signer,
 		DeliverServiceConfig: df.deliverServiceConfig,
 		OrdererSource:        ordererSource,
+		BCCSP:                bccsp,
+		CapabilityProvider:   provider,
 	})
 }
 
@@ -311,6 +315,12 @@ func (g *GossipService) NewConfigEventer() ConfigProcessor {
 	return newConfigEventer(g)
 }
 
+type CapabilityProvider interface {
+	// Capabilities defines the capabilities for the application portion of this channel
+	Capabilities() channelconfig.ApplicationCapabilities
+	Resources() channelconfig.Resources
+}
+
 // Support aggregates functionality of several
 // interfaces required by gossip service
 type Support struct {
@@ -318,7 +328,8 @@ type Support struct {
 	Committer            committer.Committer
 	CollectionStore      privdata.CollectionStore
 	IdDeserializeFactory gossipprivdata.IdentityDeserializerFactory
-	CapabilityProvider   gossipprivdata.CapabilityProvider
+	CapabilityProvider   CapabilityProvider
+	BCCSP                bccsp.BCCSP
 }
 
 // InitializeChannel allocates the state provider and should be invoked once per channel per execution
@@ -381,7 +392,7 @@ func (g *GossipService) InitializeChannel(channelID string, ordererSource *order
 		blockingMode,
 		stateConfig)
 	if g.deliveryService[channelID] == nil {
-		g.deliveryService[channelID] = g.deliveryFactory.Service(g, ordererSource, g.mcs, g.serviceConfig.OrgLeader)
+		g.deliveryService[channelID] = g.deliveryFactory.Service(g, ordererSource, g.mcs, g.serviceConfig.OrgLeader, support.BCCSP, support.CapabilityProvider)
 	}
 
 	// Delivery service might be nil only if it was not able to get connected

@@ -105,7 +105,12 @@ func (creator *BlockPullerCreator) BlockPuller(configBlock *common.Block, stopCh
 		BufferSize:                   creator.clusterConfig.ReplicationBufferSize,
 	}
 
-	return replication.NewBlockFetcher(fc, creator.signer, creator.bccsp, configBlock, creator.dialerConfig, creator.VerifyBlockSequence, stopChannel)
+	bundle, err := replication.BundleFromConfigBlock(configBlock, creator.bccsp)
+	if err != nil {
+		return nil, err
+	}
+
+	return replication.NewBlockFetcher(fc, creator.signer, creator.bccsp, bundle, creator.dialerConfig, creator.VerifyBlockSequence, stopChannel)
 }
 
 // UpdateVerifierFromConfigBlock creates a new block signature verifier from the config block and updates the internal

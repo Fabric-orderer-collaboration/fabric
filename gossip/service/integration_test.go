@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/deliverservice"
 	"github.com/hyperledger/fabric/gossip/api"
@@ -70,8 +71,8 @@ type embeddingDeliveryServiceFactory struct {
 	DeliveryServiceFactory
 }
 
-func (edsf *embeddingDeliveryServiceFactory) Service(g GossipServiceAdapter, endpoints *orderers.ConnectionSource, mcs api.MessageCryptoService, isStaticLeader bool) deliverservice.DeliverService {
-	ds := edsf.DeliveryServiceFactory.Service(g, endpoints, mcs, false)
+func (edsf *embeddingDeliveryServiceFactory) Service(g GossipServiceAdapter, endpoints *orderers.ConnectionSource, mcs api.MessageCryptoService, isStaticLeader bool, bccsp bccsp.BCCSP, provider CapabilityProvider) deliverservice.DeliverService {
+	ds := edsf.DeliveryServiceFactory.Service(g, endpoints, mcs, false, nil, nil)
 	return newEmbeddingDeliveryService(ds)
 }
 

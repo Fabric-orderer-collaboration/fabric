@@ -373,25 +373,28 @@ type iBCCSP interface {
 }
 
 func TestBlockVerifierBuilderEmptyBlock(t *testing.T) {
-	bvfunc := replication.BlockVerifierBuilder(&mocks.BCCSP{})
+	// bvfunc := replication.BlockVerifierBuilder()
 	block := &common.Block{}
-	verifier := bvfunc(block)
-	require.ErrorContains(t, verifier(nil, nil), "initialized with an invalid config block: block contains no data")
+	_, err := replication.BundleFromConfigBlock(block, &mocks.BCCSP{})
+	// verifier := bvfunc(block)
+	require.ErrorContains(t, err, "block contains no data")
 }
 
-func TestBlockVerifierBuilderNoConfigBlock(t *testing.T) {
-	bvfunc := replication.BlockVerifierBuilder(&mocks.BCCSP{})
-	block := createBlockChain(3, 3)[0]
-	verifier := bvfunc(block)
-	md := &common.BlockMetadata{}
-	require.ErrorContains(t, verifier(nil, md), "initialized with an invalid config block: channelconfig Config cannot be nil")
-}
+// func TestBlockVerifierBuilderNoConfigBlock(t *testing.T) {
+// 	bvfunc := replication.BlockVerifierBuilder()
+// 	block := createBlockChain(3, 3)[0]
+// 	verifier := bvfunc(block)
+// 	md := &common.BlockMetadata{}
+// 	require.ErrorContains(t, verifier(nil, md), "initialized with an invalid config block: channelconfig Config cannot be nil")
+// }
 
 func TestBlockVerifierFunc(t *testing.T) {
 	block := sampleConfigBlock()
-	bvfunc := replication.BlockVerifierBuilder(&mocks.BCCSP{})
+	bvfunc := replication.BlockVerifierBuilder()
 
-	verifier := bvfunc(block)
+	config, err := replication.BundleFromConfigBlock(block, &mocks.BCCSP{})
+	require.NoError(t, err)
+	verifier := bvfunc(config)
 
 	header := &common.BlockHeader{}
 	md := &common.BlockMetadata{
@@ -405,7 +408,7 @@ func TestBlockVerifierFunc(t *testing.T) {
 		},
 	}
 
-	err := verifier(header, md)
+	err = verifier(header, md)
 	require.NoError(t, err)
 }
 

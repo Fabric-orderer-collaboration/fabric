@@ -362,7 +362,12 @@ func BlockPullerFromConfigBlock(conf PullerConfig, block *common.Block, verifier
 		return nil, errors.New("nil block")
 	}
 
-	endpoints, err := replication.EndpointconfigFromConfigBlock(block, bccsp)
+	bundle, err := replication.BundleFromConfigBlock(block, bccsp)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoints, err := replication.EndpointconfigFromConfig(bundle)
 	if err != nil {
 		return nil, err
 	}

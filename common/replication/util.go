@@ -18,7 +18,6 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric-config/protolator"
 	"github.com/hyperledger/fabric-protos-go/common"
-	"github.com/hyperledger/fabric-protos-go/msp"
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
@@ -26,7 +25,6 @@ import (
 	"github.com/hyperledger/fabric/common/policies"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/internal/pkg/comm"
-	mspconstants "github.com/hyperledger/fabric/msp"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -290,26 +288,33 @@ func (ep EndpointCriteria) String() string {
 	return string(rawJSON)
 }
 
-// EndpointconfigFromConfigBlock retrieves TLS CA certificates and endpoints
-// from a config block.
-func EndpointconfigFromConfigBlock(block *common.Block, bccsp bccsp.BCCSP) ([]EndpointCriteria, error) {
-	if block == nil {
-		return nil, errors.New("nil block")
-	}
-	envelopeConfig, err := protoutil.ExtractEnvelope(block, 0)
-	if err != nil {
-		return nil, err
-	}
+// // EndpointconfigFromConfigBlock retrieves TLS CA certificates and endpoints
+// // from a config block.
+// func EndpointconfigFromConfigBlock(block *common.Block, bccsp bccsp.BCCSP) ([]EndpointCriteria, error) {
+// 	if block == nil {
+// 		return nil, errors.New("nil block")
+// 	}
+// 	envelopeConfig, err := protoutil.ExtractEnvelope(block, 0)
+// 	if err != nil {
+// 		return nil, err
+// 	}
 
-	bundle, err := channelconfig.NewBundleFromEnvelope(envelopeConfig, bccsp)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed extracting bundle from envelope")
-	}
-	msps, err := bundle.MSPManager().GetMSPs()
+// 	bundle, err := channelconfig.NewBundleFromEnvelope(envelopeConfig, bccsp)
+// 	if err != nil {
+// 		return nil, errors.Wrap(err, "failed extracting bundle from envelope")
+// 	}
+
+// 	return EndpointconfigFromConfig(bundle)
+// }
+
+// EndpointconfigFromConfig retrieves TLS CA certificates and endpoints
+// from a config block.
+func EndpointconfigFromConfig(resources channelconfig.Resources) ([]EndpointCriteria, error) {
+	msps, err := resources.MSPManager().GetMSPs()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed obtaining MSPs from MSPManager")
 	}
-	ordererConfig, ok := bundle.OrdererConfig()
+	ordererConfig, ok := resources.OrdererConfig()
 	if !ok {
 		return nil, errors.New("failed obtaining orderer config from bundle")
 	}
@@ -337,7 +342,7 @@ func EndpointconfigFromConfigBlock(block *common.Block, bccsp bccsp.BCCSP) ([]En
 		return endpointsPerOrg, nil
 	}
 
-	return globalEndpointsFromConfig(aggregatedTLSCerts, bundle), nil
+	return globalEndpointsFromConfig(aggregatedTLSCerts, resources), nil
 }
 
 func perOrgEndpoints(ordererConfig channelconfig.Orderer, mspIDsToCerts map[string][][]byte) []EndpointCriteria {
@@ -355,7 +360,7 @@ func perOrgEndpoints(ordererConfig channelconfig.Orderer, mspIDsToCerts map[stri
 	return endpointsPerOrg
 }
 
-func globalEndpointsFromConfig(aggregatedTLSCerts [][]byte, bundle *channelconfig.Bundle) []EndpointCriteria {
+func globalEndpointsFromConfig(aggregatedTLSCerts [][]byte, bundle channelconfig.Resources) []EndpointCriteria {
 	var globalEndpoints []EndpointCriteria
 	for _, endpoint := range bundle.ChannelConfig().OrdererAddresses() {
 		globalEndpoints = append(globalEndpoints, EndpointCriteria{
@@ -432,7 +437,7 @@ var ErrNotInChannel = errors.New("not in the channel")
 
 var ErrRetryCountExhausted = errors.New("retry attempts exhausted")
 
-func bundleFromConfigBlock(block *common.Block, bccsp bccsp.BCCSP) (*channelconfig.Bundle, error) {
+func BundleFromConfigBlock(block *common.Block, bccsp bccsp.BCCSP) (*channelconfig.Bundle, error) {
 	if block.Data == nil || len(block.Data.Data) == 0 {
 		return nil, errors.New("block contains no data")
 	}
@@ -451,22 +456,17 @@ func bundleFromConfigBlock(block *common.Block, bccsp bccsp.BCCSP) (*channelconf
 }
 
 // getConsentersAndPolicyFromConfigBlock returns a tuple of (bftEnabled, consenters, policy, error)
-func getConsentersAndPolicyFromConfigBlock(block *common.Block, bccsp bccsp.BCCSP) (bool, []*common.Consenter, policies.Policy, error) {
-	bundle, err := bundleFromConfigBlock(block, bccsp)
-	if err != nil {
-		return false, nil, nil, err
-	}
-
-	policy, exists := bundle.PolicyManager().GetPolicy(policies.BlockValidation)
+func getConsentersAndPolicyFromConfig(config channelconfig.Resources) (bool, []*common.Consenter, policies.Policy, error) {
+	policy, exists := config.PolicyManager().GetPolicy(policies.BlockValidation)
 	if !exists {
 		return false, nil, nil, errors.New("no policies in config block")
 	}
 
-	bftEnabled := bundle.ChannelConfig().Capabilities().ConsensusTypeBFT()
+	bftEnabled := config.ChannelConfig().Capabilities().ConsensusTypeBFT()
 
 	var consenters []*common.Consenter
 	if bftEnabled {
-		cfg, ok := bundle.OrdererConfig()
+		cfg, ok := config.OrdererConfig()
 		if !ok {
 			return false, nil, nil, errors.New("no orderer section in config block")
 		}
@@ -477,64 +477,64 @@ func getConsentersAndPolicyFromConfigBlock(block *common.Block, bccsp bccsp.BCCS
 }
 
 // BFTEnabledInConfig takes a config block as input and returns true if consenter type is BFT and also returns 'f', max byzantine suspected nodes
-func BFTEnabledInConfig(block *common.Block, bccsp bccsp.BCCSP) (bool, int, error) {
-	bftEnabled, consenters, _, err := getConsentersAndPolicyFromConfigBlock(block, bccsp)
+func bftEnabledInConfig(config channelconfig.Resources) (bool, int, error) {
+	bftEnabled, consenters, _, err := getConsentersAndPolicyFromConfig(config)
 	// in a bft setting, total consenter nodes should be atleast `3f+1`, to tolerate f failures
 	f := int((len(consenters) - 1) / 3)
 	return bftEnabled, f, err
 }
 
-// EndpointconfigFromConfigBlockV3 retrieves TLS CA certificates and endpoints from a config block.
-// Unlike the EndpointconfigFromConfigBlockV function, it doesn't use a BCCSP and also doesn't honor global orderer addresses.
-func EndpointconfigFromConfigBlockV3(block *common.Block) ([]EndpointCriteria, error) {
-	if block == nil {
-		return nil, errors.New("nil block")
-	}
+// // endpointconfigFromConfigBlockV3 retrieves TLS CA certificates and endpoints from a config block.
+// // Unlike the EndpointconfigFromConfigBlockV function, it doesn't use a BCCSP and also doesn't honor global orderer addresses.
+// func endpointconfigFromConfigBlockV3(block *common.Block) ([]EndpointCriteria, error) {
+// 	if block == nil {
+// 		return nil, errors.New("nil block")
+// 	}
 
-	envelope, err := protoutil.ExtractEnvelope(block, 0)
-	if err != nil {
-		return nil, err
-	}
+// 	envelope, err := protoutil.ExtractEnvelope(block, 0)
+// 	if err != nil {
+// 		return nil, err
+// 	}
 
-	// unmarshal the payload bytes
-	payload, err := protoutil.UnmarshalPayload(envelope.Payload)
-	if err != nil {
-		return nil, err
-	}
+// 	// unmarshal the payload bytes
+// 	payload, err := protoutil.UnmarshalPayload(envelope.Payload)
+// 	if err != nil {
+// 		return nil, err
+// 	}
 
-	// unmarshal the config envelope bytes
-	configEnv := &common.ConfigEnvelope{}
-	if err := proto.Unmarshal(payload.Data, configEnv); err != nil {
-		return nil, err
-	}
+// 	// unmarshal the config envelope bytes
+// 	configEnv := &common.ConfigEnvelope{}
+// 	if err := proto.Unmarshal(payload.Data, configEnv); err != nil {
+// 		return nil, err
+// 	}
 
-	if configEnv.Config == nil || configEnv.Config.ChannelGroup == nil || configEnv.Config.ChannelGroup.Groups == nil ||
-		configEnv.Config.ChannelGroup.Groups[channelconfig.OrdererGroupKey] == nil || configEnv.Config.ChannelGroup.Groups[channelconfig.OrdererGroupKey].Groups == nil {
-		return nil, errors.Errorf("invalid config, orderer groups is empty")
-	}
+// 	if configEnv.Config == nil || configEnv.Config.ChannelGroup == nil || configEnv.Config.ChannelGroup.Groups == nil ||
+// 		configEnv.Config.ChannelGroup.Groups[channelconfig.OrdererGroupKey] == nil || configEnv.Config.ChannelGroup.Groups[channelconfig.OrdererGroupKey].Groups == nil {
+// 		return nil, errors.Errorf("invalid config, orderer groups is empty")
+// 	}
 
-	ordererGrp := configEnv.Config.ChannelGroup.Groups[channelconfig.OrdererGroupKey].Groups
+// 	ordererGrp := configEnv.Config.ChannelGroup.Groups[channelconfig.OrdererGroupKey].Groups
 
-	return perOrgEndpointsByMSPID(ordererGrp)
-}
+// 	return perOrgEndpointsByMSPID(ordererGrp)
+// }
 
-func BlockVerifierBuilder(bccsp bccsp.BCCSP) func(block *common.Block) protoutil.BlockVerifierFunc {
-	return func(block *common.Block) protoutil.BlockVerifierFunc {
-		bundle, err := bundleFromConfigBlock(block, bccsp)
-		if err != nil {
-			return createErrorFunc(err)
-		}
+func BlockVerifierBuilder() func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
+	return func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
+		// bundle, err := BundleFromConfigBlock(block, bccsp)
+		// if err != nil {
+		// 	return createErrorFunc(err)
+		// }
 
-		policy, exists := bundle.PolicyManager().GetPolicy(policies.BlockValidation)
+		policy, exists := config.PolicyManager().GetPolicy(policies.BlockValidation)
 		if !exists {
 			return createErrorFunc(errors.New("no policies in config block"))
 		}
 
-		bftEnabled := bundle.ChannelConfig().Capabilities().ConsensusTypeBFT()
+		bftEnabled := config.ChannelConfig().Capabilities().ConsensusTypeBFT()
 
 		var consenters []*common.Consenter
 		if bftEnabled {
-			cfg, ok := bundle.OrdererConfig()
+			cfg, ok := config.OrdererConfig()
 			if !ok {
 				return createErrorFunc(errors.New("no orderer section in config block"))
 			}
@@ -551,56 +551,56 @@ func createErrorFunc(err error) protoutil.BlockVerifierFunc {
 	}
 }
 
-func searchConsenterIdentityByID(consenters []*common.Consenter, identifier uint32) []byte {
-	for _, consenter := range consenters {
-		if consenter.Id == identifier {
-			return protoutil.MarshalOrPanic(&msp.SerializedIdentity{
-				Mspid:   consenter.MspId,
-				IdBytes: consenter.Identity,
-			})
-		}
-	}
-	return nil
-}
+// func searchConsenterIdentityByID(consenters []*common.Consenter, identifier uint32) []byte {
+// 	for _, consenter := range consenters {
+// 		if consenter.Id == identifier {
+// 			return protoutil.MarshalOrPanic(&msp.SerializedIdentity{
+// 				Mspid:   consenter.MspId,
+// 				IdBytes: consenter.Identity,
+// 			})
+// 		}
+// 	}
+// 	return nil
+// }
 
-// perOrgEndpointsByMSPID returns the per orderer org endpoints
-func perOrgEndpointsByMSPID(ordererGrp map[string]*common.ConfigGroup) ([]EndpointCriteria, error) {
-	var res []EndpointCriteria
+// // perOrgEndpointsByMSPID returns the per orderer org endpoints
+// func perOrgEndpointsByMSPID(ordererGrp map[string]*common.ConfigGroup) ([]EndpointCriteria, error) {
+// 	var res []EndpointCriteria
 
-	for _, group := range ordererGrp {
-		mspConfig := &msp.MSPConfig{}
-		if err := proto.Unmarshal(group.Values[channelconfig.MSPKey].Value, mspConfig); err != nil {
-			return nil, errors.Wrap(err, "failed parsing MSPConfig")
-		}
-		// Skip non fabric MSPs, they cannot be orderers.
-		if mspConfig.Type != int32(mspconstants.FABRIC) {
-			continue
-		}
+// 	for _, group := range ordererGrp {
+// 		mspConfig := &msp.MSPConfig{}
+// 		if err := proto.Unmarshal(group.Values[channelconfig.MSPKey].Value, mspConfig); err != nil {
+// 			return nil, errors.Wrap(err, "failed parsing MSPConfig")
+// 		}
+// 		// Skip non fabric MSPs, they cannot be orderers.
+// 		if mspConfig.Type != int32(mspconstants.FABRIC) {
+// 			continue
+// 		}
 
-		fabricConfig := &msp.FabricMSPConfig{}
-		if err := proto.Unmarshal(mspConfig.Config, fabricConfig); err != nil {
-			return nil, errors.Wrap(err, "failed marshaling FabricMSPConfig")
-		}
+// 		fabricConfig := &msp.FabricMSPConfig{}
+// 		if err := proto.Unmarshal(mspConfig.Config, fabricConfig); err != nil {
+// 			return nil, errors.Wrap(err, "failed marshaling FabricMSPConfig")
+// 		}
 
-		var rootCAs [][]byte
+// 		var rootCAs [][]byte
 
-		rootCAs = append(rootCAs, fabricConfig.TlsRootCerts...)
-		rootCAs = append(rootCAs, fabricConfig.TlsIntermediateCerts...)
+// 		rootCAs = append(rootCAs, fabricConfig.TlsRootCerts...)
+// 		rootCAs = append(rootCAs, fabricConfig.TlsIntermediateCerts...)
 
-		if perOrgAddresses := group.Values[channelconfig.EndpointsKey]; perOrgAddresses != nil {
-			ordererEndpoints := &common.OrdererAddresses{}
-			if err := proto.Unmarshal(perOrgAddresses.Value, ordererEndpoints); err != nil {
-				return nil, errors.Wrap(err, "failed unmarshalling orderer addresses")
-			}
+// 		if perOrgAddresses := group.Values[channelconfig.EndpointsKey]; perOrgAddresses != nil {
+// 			ordererEndpoints := &common.OrdererAddresses{}
+// 			if err := proto.Unmarshal(perOrgAddresses.Value, ordererEndpoints); err != nil {
+// 				return nil, errors.Wrap(err, "failed unmarshalling orderer addresses")
+// 			}
 
-			for _, endpoint := range ordererEndpoints.Addresses {
-				res = append(res, EndpointCriteria{
-					TLSRootCAs: rootCAs,
-					Endpoint:   endpoint,
-				})
-			}
-		}
-	}
+// 			for _, endpoint := range ordererEndpoints.Addresses {
+// 				res = append(res, EndpointCriteria{
+// 					TLSRootCAs: rootCAs,
+// 					Endpoint:   endpoint,
+// 				})
+// 			}
+// 		}
+// 	}
 
-	return res, nil
-}
+// 	return res, nil
+// }

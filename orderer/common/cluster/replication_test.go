@@ -863,12 +863,12 @@ func TestBlockPullerFromConfigBlockFailures(t *testing.T) {
 		},
 		{
 			name:        "invalid block",
-			expectedErr: "block data is nil",
+			expectedErr: "block contains no data",
 			block:       &common.Block{},
 		},
 		{
 			name:        "bad envelope inside block",
-			expectedErr: "failed extracting bundle from envelope: failed to unmarshal payload from envelope: error unmarshalling Payload",
+			expectedErr: "error unmarshalling Payload",
 			block: &common.Block{
 				Data: &common.BlockData{
 					Data: [][]byte{protoutil.MarshalOrPanic(&common.Envelope{

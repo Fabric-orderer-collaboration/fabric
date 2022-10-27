@@ -92,6 +92,7 @@ type Fetcher interface {
 type CapabilityProvider interface {
 	// Capabilities defines the capabilities for the application portion of this channel
 	Capabilities() channelconfig.ApplicationCapabilities
+	// Resources() channelconfig.Resources
 }
 
 // Support encapsulates set of interfaces to
@@ -133,7 +134,8 @@ type coordinator struct {
 
 // NewCoordinator creates a new instance of coordinator
 func NewCoordinator(mspID string, support Support, store *transientstore.Store, selfSignedData protoutil.SignedData, metrics *metrics.PrivdataMetrics,
-	config CoordinatorConfig, idDeserializerFactory IdentityDeserializerFactory) Coordinator {
+	config CoordinatorConfig, idDeserializerFactory IdentityDeserializerFactory,
+) Coordinator {
 	return &coordinator{
 		Support:                        support,
 		mspID:                          mspID,
@@ -364,7 +366,8 @@ type seqAndDataModel struct {
 }
 
 // map from seqAndDataModel to:
-//     map from namespace to []*rwset.CollectionPvtReadWriteSet
+//
+//	map from namespace to []*rwset.CollectionPvtReadWriteSet
 type aggregatedCollections map[seqAndDataModel]map[string][]*rwset.CollectionPvtReadWriteSet
 
 func (ac aggregatedCollections) addCollection(seqInBlock uint64, dm rwset.TxReadWriteSet_DataModel, namespace string, col *rwset.CollectionPvtReadWriteSet) {

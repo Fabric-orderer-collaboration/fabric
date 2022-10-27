@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric/bccsp"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/internal/pkg/comm"
@@ -51,6 +53,12 @@ type deliverServiceImpl struct {
 	stopping       bool
 }
 
+type CapabilityProvider interface {
+	// Capabilities defines the capabilities for the application portion of this channel
+	Capabilities() channelconfig.ApplicationCapabilities
+	Resources() channelconfig.Resources
+}
+
 // Config dictates the DeliveryService's properties,
 // namely how it connects to an ordering service endpoint,
 // how it verifies messages received from it,
@@ -69,6 +77,8 @@ type Config struct {
 	Signer identity.SignerSerializer
 	// DeliverServiceConfig is the configuration object.
 	DeliverServiceConfig *DeliverServiceConfig
+	BCCSP                bccsp.BCCSP
+	CapabilityProvider   CapabilityProvider
 }
 
 // NewDeliverService construction function to create and initialize
@@ -130,9 +140,16 @@ func (d *deliverServiceImpl) StartDeliverForChannel(chainID string, ledgerInfo b
 				SecOpts:     d.conf.DeliverServiceConfig.SecOpts,
 			},
 		},
+		ClientConfig: comm.ClientConfig{
+			DialTimeout: d.conf.DeliverServiceConfig.ConnectionTimeout,
+			KaOpts:      d.conf.DeliverServiceConfig.KeepaliveOptions,
+			SecOpts:     d.conf.DeliverServiceConfig.SecOpts,
+		},
+		BCCSP:               d.conf.BCCSP,
 		Orderers:            d.conf.OrdererSource,
 		DoneC:               make(chan struct{}),
 		Signer:              d.conf.Signer,
+		ResourceProvider:    d.conf.CapabilityProvider,
 		DeliverStreamer:     DeliverAdapter{},
 		Logger:              flogging.MustGetLogger("peer.blocksprovider").With("channel", chainID),
 		MaxRetryDelay:       d.conf.DeliverServiceConfig.ReConnectBackoffThreshold,
