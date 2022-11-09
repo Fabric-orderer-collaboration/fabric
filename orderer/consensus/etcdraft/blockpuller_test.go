@@ -4,7 +4,7 @@ Copyright IBM Corp. All Rights Reserved.
 SPDX-License-Identifier: Apache-2.0
 */
 
-package etcdraft_test
+package etcdraft
 
 import (
 	"io/ioutil"
@@ -15,25 +15,20 @@ import (
 	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/common/crypto/tlsgen"
 	"github.com/hyperledger/fabric/internal/pkg/comm"
-	"github.com/hyperledger/fabric/orderer/common/cluster"
 	"github.com/hyperledger/fabric/orderer/common/cluster/mocks"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
 	"github.com/hyperledger/fabric/orderer/consensus"
-	"github.com/hyperledger/fabric/orderer/consensus/etcdraft"
 	"github.com/hyperledger/fabric/orderer/mocks/common/multichannel"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/stretchr/testify/require"
 )
 
-func TestEndpointconfigFromFromSupport(t *testing.T) {
+func TestLastConfigBlockFromFromSupport(t *testing.T) {
 	blockBytes, err := ioutil.ReadFile("testdata/mychannel.block")
 	require.NoError(t, err)
 
 	goodConfigBlock := &common.Block{}
 	require.NoError(t, proto.Unmarshal(blockBytes, goodConfigBlock))
-
-	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
-	require.NoError(t, err)
 
 	for _, testCase := range []struct {
 		name            string
@@ -66,19 +61,6 @@ func TestEndpointconfigFromFromSupport(t *testing.T) {
 			height:        100,
 		},
 		{
-			name: "Last config block is retrieved but it is invalid",
-			blockAtHeight: &common.Block{
-				Metadata: &common.BlockMetadata{
-					Metadata: [][]byte{{}, protoutil.MarshalOrPanic(&common.Metadata{
-						Value: protoutil.MarshalOrPanic(&common.LastConfig{Index: 42}),
-					})},
-				},
-			},
-			lastConfigBlock: &common.Block{},
-			expectedError:   "block data is nil",
-			height:          100,
-		},
-		{
 			name: "Last config block is retrieved and is valid",
 			blockAtHeight: &common.Block{
 				Metadata: &common.BlockMetadata{
@@ -99,19 +81,20 @@ func TestEndpointconfigFromFromSupport(t *testing.T) {
 			cs.BlockByIndex[cs.HeightVal-1] = testCase.blockAtHeight
 			cs.BlockByIndex[42] = testCase.lastConfigBlock
 
-			certs, err := etcdraft.EndpointconfigFromSupport(cs, cryptoProvider)
+			block, err := lastConfigBlockFromSupport(cs)
 			if testCase.expectedError == "" {
-				require.NotNil(t, certs)
+				require.NotNil(t, block)
+				require.NotNil(t, block.Data)
 				require.NoError(t, err)
 				return
 			}
 			require.EqualError(t, err, testCase.expectedError)
-			require.Nil(t, certs)
+			require.Nil(t, block)
 		})
 	}
 }
 
-func TestNewBlockPuller(t *testing.T) {
+func TestNewBlockFetcher(t *testing.T) {
 	ca, err := tlsgen.NewCA()
 	require.NoError(t, err)
 
@@ -135,20 +118,19 @@ func TestNewBlockPuller(t *testing.T) {
 			42: goodConfigBlock,
 			99: lastBlock,
 		},
+		ChannelIDVal: "mychannel",
 	}
 
-	dialer := &cluster.PredicateDialer{
-		Config: comm.ClientConfig{
-			SecOpts: comm.SecureOptions{
-				Certificate: ca.CertBytes(),
-			},
+	dialerConfig := comm.ClientConfig{
+		SecOpts: comm.SecureOptions{
+			Certificate: ca.CertBytes(),
 		},
 	}
 
 	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
 	require.NoError(t, err)
 
-	bp, err := etcdraft.NewBlockPuller(cs, dialer, localconfig.Cluster{}, cryptoProvider)
+	bp, err := NewBlockFetcher(cs, dialerConfig, localconfig.Cluster{}, cryptoProvider)
 	require.NoError(t, err)
 	require.NotNil(t, bp)
 
@@ -157,7 +139,7 @@ func TestNewBlockPuller(t *testing.T) {
 		name          string
 		expectedError string
 		cs            consensus.ConsenterSupport
-		dialer        *cluster.PredicateDialer
+		dialer        comm.ClientConfig
 		certificate   []byte
 	}{
 		{
@@ -167,19 +149,19 @@ func TestNewBlockPuller(t *testing.T) {
 			},
 			certificate:   ca.CertBytes(),
 			expectedError: "unable to retrieve block [99]",
-			dialer:        dialer,
+			dialer:        dialerConfig,
 		},
 		{
 			name:          "Certificate is invalid",
 			cs:            cs,
 			certificate:   []byte{1, 2, 3},
 			expectedError: "client certificate isn't in PEM format: \x01\x02\x03",
-			dialer:        dialer,
+			dialer:        dialerConfig,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			testCase.dialer.Config.SecOpts.Certificate = testCase.certificate
-			bp, err := etcdraft.NewBlockPuller(testCase.cs, testCase.dialer, localconfig.Cluster{}, cryptoProvider)
+			testCase.dialer.SecOpts.Certificate = testCase.certificate
+			bp, err := NewBlockFetcher(testCase.cs, testCase.dialer, localconfig.Cluster{}, cryptoProvider)
 			require.Nil(t, bp)
 			require.EqualError(t, err, testCase.expectedError)
 		})
@@ -200,7 +182,7 @@ func TestLedgerBlockPuller(t *testing.T) {
 	puller := &mocks.ChainPuller{}
 	puller.On("PullBlock", uint64(1)).Return(notGenesisBlock)
 
-	lbp := &etcdraft.LedgerBlockPuller{
+	lbp := &LedgerBlockPuller{
 		Height:         currHeight,
 		BlockRetriever: blockRetriever,
 		BlockPuller:    puller,

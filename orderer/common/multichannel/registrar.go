@@ -23,6 +23,7 @@ import (
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/ledger/blockledger"
 	"github.com/hyperledger/fabric/common/metrics"
+	"github.com/hyperledger/fabric/common/replication"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/orderer/common/blockcutter"
 	"github.com/hyperledger/fabric/orderer/common/cluster"
@@ -385,7 +386,7 @@ func (r *Registrar) initAppChannelsWhenSystemChannelExists(existingChannels []st
 	}
 }
 
-func (r *Registrar) initLedgerResourcesClusterConsenter(configBlock *cb.Block) (*ledgerResources, consensus.ClusterConsenter, error) {
+func (r *Registrar) initLedgerResourcesClusterConsenter(configBlock *cb.Block) (*replication.LedgerResources, consensus.ClusterConsenter, error) {
 	configEnv, err := protoutil.ExtractEnvelope(configBlock, 0)
 	if err != nil {
 		return nil, nil, errors.WithMessagef(err, "failed extracting config envelope from block")
@@ -484,7 +485,7 @@ func (r *Registrar) GetFollower(chainID string) *follower.Chain {
 	return r.followers[chainID]
 }
 
-func (r *Registrar) newLedgerResources(configTx *cb.Envelope) (*ledgerResources, error) {
+func (r *Registrar) newLedgerResources(configTx *cb.Envelope) (*replication.LedgerResources, error) {
 	payload, err := protoutil.UnmarshalPayload(configTx.Payload)
 	if err != nil {
 		return nil, errors.WithMessage(err, "error umarshaling envelope to payload")
@@ -509,7 +510,7 @@ func (r *Registrar) newLedgerResources(configTx *cb.Envelope) (*ledgerResources,
 		return nil, errors.WithMessage(err, "error creating channelconfig bundle")
 	}
 
-	err = checkResources(bundle)
+	err = replication.CheckResources(bundle)
 	if err != nil {
 		return nil, errors.WithMessagef(err, "error checking bundle for channel: %s", chdr.ChannelId)
 	}
@@ -519,13 +520,7 @@ func (r *Registrar) newLedgerResources(configTx *cb.Envelope) (*ledgerResources,
 		return nil, errors.WithMessagef(err, "error getting ledger for channel: %s", chdr.ChannelId)
 	}
 
-	return &ledgerResources{
-		configResources: &configResources{
-			mutableResources: channelconfig.NewBundleSource(bundle, r.callbacks...),
-			bccsp:            r.bccsp,
-		},
-		ReadWriter: ledger,
-	}, nil
+	return replication.NewLedgerResources(channelconfig.NewBundleSource(bundle, r.callbacks...), r.bccsp, ledger), nil
 }
 
 // CreateChain makes the Registrar create a consensus.Chain with the given name.
@@ -826,7 +821,7 @@ func (r *Registrar) JoinChannel(channelID string, configBlock *cb.Block, isAppCh
 	return info, err
 }
 
-func (r *Registrar) createAsMember(ledgerRes *ledgerResources, configBlock *cb.Block, channelID string) (*ChainSupport, types.ChannelInfo, error) {
+func (r *Registrar) createAsMember(ledgerRes *replication.LedgerResources, configBlock *cb.Block, channelID string) (*ChainSupport, types.ChannelInfo, error) {
 	if ledgerRes.Height() == 0 {
 		if err := ledgerRes.Append(configBlock); err != nil {
 			return nil, types.ChannelInfo{}, errors.WithMessage(err, "failed to append join block to the ledger")
@@ -858,14 +853,14 @@ func (r *Registrar) createAsMember(ledgerRes *ledgerResources, configBlock *cb.B
 
 // createFollower created a follower.Chain, puts it in the map, but does not start it.
 func (r *Registrar) createFollower(
-	ledgerRes *ledgerResources,
+	ledgerRes *replication.LedgerResources,
 	clusterConsenter consensus.ClusterConsenter,
 	joinBlock *cb.Block,
 	channelID string,
 ) (*follower.Chain, types.ChannelInfo, error) {
 	fLog := flogging.MustGetLogger("orderer.commmon.follower")
 	blockPullerCreator, err := follower.NewBlockPullerCreator(
-		channelID, fLog, r.signer, r.clusterDialer, r.config.General.Cluster, r.bccsp)
+		channelID, fLog, r.signer, r.clusterDialer.Config, r.config.General.Cluster, r.bccsp)
 	if err != nil {
 		return nil, types.ChannelInfo{}, errors.WithMessagef(err, "failed to create BlockPullerFactory for channel %s", channelID)
 	}
@@ -903,7 +898,7 @@ func (r *Registrar) createFollower(
 
 // Assumes the system channel join-block is saved to the file repo.
 func (r *Registrar) joinSystemChannel(
-	ledgerRes *ledgerResources,
+	ledgerRes *replication.LedgerResources,
 	clusterConsenter consensus.ClusterConsenter,
 	configBlock *cb.Block,
 	channelID string,

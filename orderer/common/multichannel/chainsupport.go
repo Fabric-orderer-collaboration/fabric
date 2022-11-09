@@ -10,6 +10,7 @@ import (
 	cb "github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/ledger/blockledger"
+	"github.com/hyperledger/fabric/common/replication"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/orderer/common/blockcutter"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
@@ -23,7 +24,7 @@ import (
 
 // ChainSupport holds the resources for a particular channel.
 type ChainSupport struct {
-	*ledgerResources
+	*replication.LedgerResources
 	msgprocessor.Processor
 	*BlockWriter
 	consensus.Chain
@@ -44,7 +45,7 @@ type ChainSupport struct {
 
 func newChainSupport(
 	registrar *Registrar,
-	ledgerResources *ledgerResources,
+	ledgerResources *replication.LedgerResources,
 	consenters map[string]consensus.Consenter,
 	signer identity.SignerSerializer,
 	blockcutterMetrics *blockcutter.Metrics,
@@ -61,7 +62,7 @@ func newChainSupport(
 
 	// Construct limited support needed as a parameter for additional support
 	cs := &ChainSupport{
-		ledgerResources:  ledgerResources,
+		LedgerResources:  ledgerResources,
 		SignerSerializer: signer,
 		cutter: blockcutter.NewReceiverImpl(
 			ledgerResources.ConfigtxValidator().ChannelID(),
@@ -143,7 +144,7 @@ func (cs *ChainSupport) ProposeConfigUpdate(configtx *cb.Envelope) (*cb.ConfigEn
 		return nil, err
 	}
 
-	if err = checkResources(bundle); err != nil {
+	if err = replication.CheckResources(bundle); err != nil {
 		return nil, errors.WithMessage(err, "config update is not compatible")
 	}
 
@@ -181,15 +182,15 @@ func (cs *ChainSupport) Sequence() uint64 {
 // Append appends a new block to the ledger in its raw form,
 // unlike WriteBlock that also mutates its metadata.
 func (cs *ChainSupport) Append(block *cb.Block) error {
-	return cs.ledgerResources.ReadWriter.Append(block)
+	return cs.LedgerResources.ReadWriter.Append(block)
 }
 
 func newOnBoardingChainSupport(
-	ledgerResources *ledgerResources,
+	ledgerResources *replication.LedgerResources,
 	config localconfig.TopLevel,
 	bccsp bccsp.BCCSP,
 ) (*ChainSupport, error) {
-	cs := &ChainSupport{ledgerResources: ledgerResources}
+	cs := &ChainSupport{LedgerResources: ledgerResources}
 	cs.Processor = msgprocessor.NewStandardChannel(cs, msgprocessor.CreateStandardChannelFilters(cs, config), bccsp)
 	cs.Chain = &inactive.Chain{Err: errors.New("system channel creation pending: server requires restart")}
 	cs.StatusReporter = consensus.StaticStatusReporter{ConsensusRelation: types.ConsensusRelationConsenter, Status: types.StatusInactive}

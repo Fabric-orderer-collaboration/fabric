@@ -27,6 +27,7 @@ import (
 	"github.com/hyperledger/fabric/common/ledger/blockledger/fileledger"
 	"github.com/hyperledger/fabric/common/metrics/disabled"
 	"github.com/hyperledger/fabric/common/policies"
+	"github.com/hyperledger/fabric/common/replication"
 	"github.com/hyperledger/fabric/core/config/configtest"
 	"github.com/hyperledger/fabric/internal/configtxgen/encoder"
 	"github.com/hyperledger/fabric/internal/configtxgen/genesisconfig"
@@ -781,7 +782,7 @@ func TestCreateChain(t *testing.T) {
 
 		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
 		require.NoError(t, err)
-		rcs, err := newChainSupport(manager, chainSupport.ledgerResources, consenters, mockCrypto(), blockcutter.NewMetrics(&disabled.Provider{}), cryptoProvider)
+		rcs, err := newChainSupport(manager, chainSupport.LedgerResources, consenters, mockCrypto(), blockcutter.NewMetrics(&disabled.Provider{}), cryptoProvider)
 		require.NoError(t, err)
 		require.Equal(t, expectedLastConfigSeq, rcs.lastConfigSeq, "On restart, incorrect lastConfigSeq")
 	})
@@ -802,14 +803,14 @@ func TestResourcesCheck(t *testing.T) {
 		mockResources.OrdererConfigReturns(mockOrderer, true)
 		mockResources.ChannelConfigReturns(mockChannel)
 
-		err := checkResources(mockResources)
+		err := replication.CheckResources(mockResources)
 		require.NoError(t, err)
 	})
 
 	t.Run("MissingOrdererConfigPanic", func(t *testing.T) {
 		mockResources.OrdererConfigReturns(nil, false)
 
-		err := checkResources(mockResources)
+		err := replication.CheckResources(mockResources)
 		require.Error(t, err)
 		require.Regexp(t, "config does not contain orderer config", err.Error())
 	})
@@ -818,7 +819,7 @@ func TestResourcesCheck(t *testing.T) {
 		mockResources.OrdererConfigReturns(mockOrderer, true)
 		mockOrdererCaps.SupportedReturns(errors.New("An error"))
 
-		err := checkResources(mockResources)
+		err := replication.CheckResources(mockResources)
 		require.Error(t, err)
 		require.Regexp(t, "config requires unsupported orderer capabilities:", err.Error())
 
@@ -829,7 +830,7 @@ func TestResourcesCheck(t *testing.T) {
 	t.Run("MissingChannelCapability", func(t *testing.T) {
 		mockChannelCaps.SupportedReturns(errors.New("An error"))
 
-		err := checkResources(mockResources)
+		err := replication.CheckResources(mockResources)
 		require.Error(t, err)
 		require.Regexp(t, "config requires unsupported channel capabilities:", err.Error())
 	})
@@ -838,7 +839,9 @@ func TestResourcesCheck(t *testing.T) {
 		mockResources.OrdererConfigReturns(nil, false)
 
 		require.Panics(t, func() {
-			checkResourcesOrPanic(mockResources)
+			if err := replication.CheckResources(mockResources); err != nil {
+				logger.Panicf("[channel %s] %s", mockResources.ConfigtxValidator().ChannelID(), err)
+			}
 		})
 	})
 }

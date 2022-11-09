@@ -9,14 +9,14 @@ package multichannel
 import (
 	"testing"
 
-	"github.com/hyperledger/fabric/orderer/common/localconfig"
-	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
-	"github.com/hyperledger/fabric/orderer/common/types"
-
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric/bccsp/sw"
+	"github.com/hyperledger/fabric/common/replication"
+	"github.com/hyperledger/fabric/orderer/common/localconfig"
+	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
 	msgprocessormocks "github.com/hyperledger/fabric/orderer/common/msgprocessor/mocks"
 	"github.com/hyperledger/fabric/orderer/common/multichannel/mocks"
+	"github.com/hyperledger/fabric/orderer/common/types"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -41,12 +41,7 @@ func TestConsensusMetadataValidation(t *testing.T) {
 	require.NoError(t, err)
 	mv := &msgprocessormocks.MetadataValidator{}
 	cs := &ChainSupport{
-		ledgerResources: &ledgerResources{
-			configResources: &configResources{
-				mutableResources: ms,
-				bccsp:            cryptoProvider,
-			},
-		},
+		LedgerResources:   replication.NewLedgerResources(ms, cryptoProvider, nil),
 		MetadataValidator: mv,
 		BCCSP:             cryptoProvider,
 	}
@@ -82,13 +77,7 @@ func TestNewOnboardingChainSupport(t *testing.T) {
 
 	mockRW := &mocks.ReadWriter{}
 	mockRW.HeightReturns(7)
-	ledgerRes := &ledgerResources{
-		configResources: &configResources{
-			mutableResources: ms,
-			bccsp:            cryptoProvider,
-		},
-		ReadWriter: mockRW,
-	}
+	ledgerRes := replication.NewLedgerResources(ms, cryptoProvider, mockRW)
 
 	cs, err := newOnBoardingChainSupport(ledgerRes, localconfig.TopLevel{}, cryptoProvider)
 	require.NoError(t, err)
