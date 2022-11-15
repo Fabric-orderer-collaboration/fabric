@@ -4,7 +4,7 @@ package mocks
 
 import (
 	common "github.com/hyperledger/fabric-protos-go/common"
-	cluster "github.com/hyperledger/fabric/orderer/common/cluster"
+	"github.com/hyperledger/fabric/common/replication"
 
 	mock "github.com/stretchr/testify/mock"
 )
@@ -15,15 +15,15 @@ type VerifierFactory struct {
 }
 
 // VerifierFromConfig provides a mock function with given fields: configuration, channel
-func (_m *VerifierFactory) VerifierFromConfig(configuration *common.ConfigEnvelope, channel string) (cluster.BlockVerifier, error) {
+func (_m *VerifierFactory) VerifierFromConfig(configuration *common.ConfigEnvelope, channel string) (replication.BlockVerifier, error) {
 	ret := _m.Called(configuration, channel)
 
-	var r0 cluster.BlockVerifier
-	if rf, ok := ret.Get(0).(func(*common.ConfigEnvelope, string) cluster.BlockVerifier); ok {
+	var r0 replication.BlockVerifier
+	if rf, ok := ret.Get(0).(func(*common.ConfigEnvelope, string) replication.BlockVerifier); ok {
 		r0 = rf(configuration, channel)
 	} else {
 		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(cluster.BlockVerifier)
+			r0 = ret.Get(0).(replication.BlockVerifier)
 		}
 	}
 

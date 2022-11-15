@@ -375,6 +375,7 @@ func (p *Peer) createChannel(
 		CollectionStore:      simpleCollectionStore,
 		IdDeserializeFactory: idDeserializerFactory,
 		CapabilityProvider:   channel,
+		BCCSP:                p.CryptoProvider,
 	})
 
 	p.mutex.Lock()

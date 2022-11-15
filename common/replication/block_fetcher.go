@@ -17,8 +17,10 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric/bccsp"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/hyperledger/fabric/common/util"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
@@ -31,6 +33,8 @@ const (
 	ShuffleSource BlockSourceOp = iota
 	CurrentSource
 )
+
+var logger = flogging.MustGetLogger("replication")
 
 //go:generate mockery -dir . -name BlockSource -case underscore -output mocks/
 
@@ -99,7 +103,7 @@ func (p *AttestationPuller) seekNextEnvelope(startSeq uint64) (*common.Envelope,
 		nextSeekInfo(startSeq),
 		int32(0),
 		uint64(0),
-		util.ComputeSHA256(p.Config.TLSCert),
+		p.Config.TLSCertHash,
 	)
 }
 
@@ -257,21 +261,23 @@ func newImpatientStream(conn *grpc.ClientConn, waitTimeout time.Duration, env *c
 // FetcherConfig stores the configuration parameters needed to create a BlockFetcher
 type FetcherConfig struct {
 	Channel                      string
-	TLSCert                      []byte
+	TLSCertHash                  []byte
 	Endpoints                    []EndpointCriteria
 	FetchTimeout                 time.Duration
+	RetryTimeout                 time.Duration
 	CensorshipSuspicionThreshold time.Duration
 	PeriodicalShuffleInterval    time.Duration
 	MaxRetries                   uint64
 	MaxByzantineNodes            int
+	BufferSize                   int
 }
 
 // UpdateFetcherConfigFromConfigBlock updates the endpoints in fetcherconfig from a config block.
 // if it is unable to fetch endpoints from a config block, it doesn't udate the endpoints in FetcherConfig.
 // the error returned may be logged.
-func UpdateFetcherConfigFromConfigBlock(c FetcherConfig, latestConfigBlock *common.Block) (FetcherConfig, error) {
+func UpdateFetcherConfigFromConfigBlock(c FetcherConfig, latestConfig channelconfig.Resources) (FetcherConfig, error) {
 	fetcherConfig := c
-	endpoints, err := EndpointconfigFromConfigBlockV3(latestConfigBlock)
+	endpoints, err := EndpointsFromConfig(latestConfig)
 
 	if err == nil {
 		// update endpoints from config block
@@ -286,15 +292,17 @@ type TimeFunc func() time.Time
 type BlockFetcher struct {
 	// Configuration
 	FetcherConfig
-	LastConfigBlock          *common.Block
-	BlockVerifierFactory     func(block *common.Block) protoutil.BlockVerifierFunc
+	LastConfig               channelconfig.Resources
+	ConfigSequence           uint64
+	BlockVerifierFactory     func(config channelconfig.Resources) protoutil.BlockVerifierFunc
 	VerifyBlock              protoutil.BlockVerifierFunc
-	AttestationSourceFactory func(fc FetcherConfig, latestConfigBlock *common.Block) (AttestationSource, error)
-	BlockSourceFactory       func(fc FetcherConfig, latestConfigBlock *common.Block) (BlockSource, error)
+	AttestationSourceFactory func(fc FetcherConfig, latestConfig channelconfig.Resources) (AttestationSource, error)
+	BlockSourceFactory       func(fc FetcherConfig, latestConfig channelconfig.Resources) (BlockSource, error)
 	Logger                   *flogging.FabricLogger
 	TimeNow                  TimeFunc
 	Signer                   identity.SignerSerializer
 	Dialer                   Dialer
+	bccsp                    bccsp.BCCSP
 	// State
 	currentEndpoint         EndpointCriteria
 	lastShuffledAt          time.Time
@@ -304,6 +312,108 @@ type BlockFetcher struct {
 	currentBlockSource      BlockSource
 	suspects                suspectSet // a set of bft suspected nodes.
 	setupVerifierInProgress bool
+}
+
+func NewBlockFetcher(fc FetcherConfig, signer identity.SignerSerializer, bccsp bccsp.BCCSP, lastConfig channelconfig.Resources, dialerConfig comm.ClientConfig, verifyBlockSequence BlockSequenceVerifier, stopChannel chan struct{}) (*BlockFetcher, error) {
+	var err error
+	fc.Endpoints, err = EndpointsFromConfig(lastConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	bf_logger := flogging.MustGetLogger("common.replication.puller").With("channel", fc.Channel)
+
+	stdDialer := &StandardDialer{
+		Config: dialerConfig,
+	}
+	stdDialer.Config.AsyncConnect = false
+	stdDialer.Config.SecOpts.VerifyCertificate = nil
+
+	// modify the verifier builder with middleware to skip verifying the genesis block
+	// in the follower chain
+	modifiedVerifierBuilder := func(blockVerifierFunction protoutil.BlockVerifierFunc) protoutil.BlockVerifierFunc {
+		return protoutil.BlockVerifierFunc(
+			func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
+				// don't verify the genesis block
+				if header.Number == 0 {
+					bf_logger.Debugf("Not verfying genesis block for follower chain")
+					return nil
+				}
+
+				return blockVerifierFunction(header, metadata)
+			})
+	}
+
+	// wrap the verifier factory to stop verifying genesis block
+	verifierFactory := func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
+		vf := BlockVerifierBuilder()
+		return modifiedVerifierBuilder(vf(config))
+	}
+
+	// To tolerate byzantine behaviour of `f` faulty nodes, we need atleast of `3f + 1` nodes.
+	// check for bft enable and update `MaxByzantineNodes`
+	// accordingly.
+	bftEnabled, f, err := bftEnabledInConfig(lastConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	var verifyBlockFunc protoutil.BlockVerifierFunc
+	if bftEnabled && f > 0 {
+		fc.MaxByzantineNodes = f
+		// setting verifyBlockFunc, will make BlockFetcher pull genesis block in a bft setting and
+		// intialize the VerifyBlock function
+		verifyBlockFunc = nil
+	} else {
+		verifyBlockFunc = verifierFactory(lastConfig)
+	}
+
+	bf := &BlockFetcher{
+		FetcherConfig:        fc,
+		LastConfig:           lastConfig,
+		BlockVerifierFactory: verifierFactory,
+		VerifyBlock:          verifyBlockFunc,
+		AttestationSourceFactory: func(c FetcherConfig, latestConfig channelconfig.Resources) (AttestationSource, error) {
+			fc, err := UpdateFetcherConfigFromConfigBlock(c, latestConfig)
+			if err != nil {
+				bf_logger.Errorf("Could not update FetcherConfig fom Config Block: %v", err)
+			}
+			return &AttestationPuller{
+				Config: fc,
+				Signer: signer,
+				Dialer: stdDialer,
+				Logger: flogging.MustGetLogger("common.replication.attestationpuller").With("channel", fc.Channel),
+			}, err
+		},
+		BlockSourceFactory: func(c FetcherConfig, latestConfig channelconfig.Resources) (BlockSource, error) {
+			// update FetcherConfig from latestConfigBlock
+			fc, err := UpdateFetcherConfigFromConfigBlock(c, latestConfig)
+			if err != nil {
+				bf_logger.Errorf("Could not update FetcherConfig fom Config Block: %v", err)
+			}
+
+			return &BlockPuller{
+				VerifyBlockSequence: verifyBlockSequence,
+				Logger:              flogging.MustGetLogger("common.replication.puller").With("channel", fc.Channel),
+				RetryTimeout:        fc.RetryTimeout,
+				MaxTotalBufferBytes: fc.BufferSize,
+				FetchTimeout:        fc.FetchTimeout,
+				MaxPullBlockRetries: fc.MaxRetries,
+				Endpoints:           fc.Endpoints,
+				Signer:              signer,
+				TLSCertHash:         fc.TLSCertHash,
+				Channel:             fc.Channel,
+				Dialer:              stdDialer,
+				StopChannel:         stopChannel,
+			}, err
+		},
+		Logger:  bf_logger,
+		Signer:  signer,
+		Dialer:  stdDialer,
+		TimeNow: time.Now,
+		bccsp:   bccsp,
+	}
+	return bf, nil
 }
 
 func (bf *BlockFetcher) getBlockSource() (BlockSource, error) {
@@ -338,7 +448,7 @@ func (bf *BlockFetcher) setBlockSource(ec EndpointCriteria) error {
 	}
 	config := bf.FetcherConfig
 	config.Endpoints = []EndpointCriteria{ec}
-	blockSource, err := bf.BlockSourceFactory(config, bf.LastConfigBlock)
+	blockSource, err := bf.BlockSourceFactory(config, bf.LastConfig)
 	bf.currentBlockSource = blockSource
 	return err
 }
@@ -348,14 +458,20 @@ func (bf *BlockFetcher) maybeUpdateLatestConfigBlock(block *common.Block) {
 		return
 	}
 
+	bundle, err := BundleFromConfigBlock(block, bf.bccsp)
+	if err != nil {
+		bf.VerifyBlock = createErrorFunc(err)
+	}
+
 	seq := block.Header.Number
 	bf.Logger.Infof("Block %d contains a config transaction, updating block verification reference", seq)
-	bf.VerifyBlock = bf.BlockVerifierFactory(block)
+	bf.VerifyBlock = bf.BlockVerifierFactory(bundle)
 
-	if bf.LastConfigBlock.Header.Number < seq {
-		bf.Logger.Infof("Config block %d received is later than last config block %d, updating its reference", seq, bf.LastConfigBlock.Header.Number)
-		bf.LastConfigBlock = block
-		endpoints, err := EndpointconfigFromConfigBlockV3(block)
+	if bf.ConfigSequence < seq {
+		bf.Logger.Infof("Config block %d received is later than last config block %d, updating its reference", seq, bf.ConfigSequence)
+		bf.ConfigSequence = seq
+		bf.LastConfig = bundle
+		endpoints, err := EndpointsFromConfig(bundle)
 		if err != nil {
 			bf.Logger.Errorf("Failed parsing orderer endpoints from block %d: %v", block.Header.Number, err)
 			return
@@ -377,14 +493,19 @@ func (bf *BlockFetcher) shuffleEndpoint() error {
 	bf.Logger.Debugf("Shuffled block puller endpoint. New endpoint: [%s]", bf.currentEndpoint)
 	err := bf.setBlockSource(bf.currentEndpoint)
 	bf.lastShuffledAt = bf.TimeNow()
+	bf.blockSourceOp = CurrentSource
 	return err
 }
 
 func (bf *BlockFetcher) blockSourceCandidates() []EndpointCriteria {
 	var candidates []EndpointCriteria
+	if len(bf.Endpoints) == 1 {
+		return bf.Endpoints
+	}
 	for _, e := range bf.Endpoints {
 		// If candidate is suspected to be censoring,
 		// or if it's the previous endpoint, don't pick it.
+		logger.Warnw("blockSourceCandidates", "e", e, "suspects", bf.suspects, "current", bf.currentEndpoint)
 		if bf.suspects.has(e.Endpoint) || e.Endpoint == bf.currentEndpoint.Endpoint {
 			continue
 		}
@@ -415,7 +536,7 @@ func (bf *BlockFetcher) pullAndVerifyAttestations(seq uint64, candidates []Endpo
 
 			config.Endpoints = []EndpointCriteria{candidate}
 
-			attestationSource, err := bf.AttestationSourceFactory(config, bf.LastConfigBlock)
+			attestationSource, err := bf.AttestationSourceFactory(config, bf.LastConfig)
 			if err != nil {
 				bf.Logger.Errorf("Failed to create attestation source: %v", err)
 				lock.Lock()
@@ -511,7 +632,7 @@ func (bf *BlockFetcher) setUpVerifierFromGenesisBlock() bool {
 			defer wg.Done()
 			config := bf.FetcherConfig
 			config.Endpoints = []EndpointCriteria{candidate}
-			blockSource, err := bf.BlockSourceFactory(config, bf.LastConfigBlock)
+			blockSource, err := bf.BlockSourceFactory(config, bf.LastConfig)
 			if err != nil {
 				bf.Logger.Errorf("Failed to create block source: %v", err)
 				return
@@ -519,6 +640,10 @@ func (bf *BlockFetcher) setUpVerifierFromGenesisBlock() bool {
 			defer blockSource.Close()
 
 			block := blockSource.PullBlock(0)
+			if block == nil {
+				bf.Logger.Warn("*** nil block")
+				return
+			}
 			// verify data hash on the block
 			if !bytes.Equal(protoutil.BlockDataHash(block.Data), block.Header.DataHash) {
 				bf.Logger.Warnf("Block data hash mismatch on block %d", block.Header.Number)
@@ -551,9 +676,14 @@ func (bf *BlockFetcher) setUpVerifierFromGenesisBlock() bool {
 	}
 
 	// Setup BlockVerifierFactory and LastConfigBlock from genesisBlock
-	bf.VerifyBlock = bf.BlockVerifierFactory(genesisBlock)
-	if bf.LastConfigBlock == nil {
-		bf.LastConfigBlock = genesisBlock
+	bundle, err := BundleFromConfigBlock(genesisBlock, bf.bccsp)
+	if err != nil {
+		bf.VerifyBlock = createErrorFunc(err)
+	} else {
+		bf.VerifyBlock = bf.BlockVerifierFactory(bundle)
+	}
+	if bf.LastConfig == nil {
+		bf.LastConfig = bundle
 	}
 	return true
 }
@@ -623,7 +753,7 @@ func (bf *BlockFetcher) PullBlock(seq uint64) *common.Block {
 
 // HeightsByEndpoints returns the block heights by endpoints of orderers
 func (bf BlockFetcher) HeightsByEndpoints() (map[string]uint64, error) {
-	bs, err := bf.BlockSourceFactory(bf.FetcherConfig, bf.LastConfigBlock)
+	bs, err := bf.BlockSourceFactory(bf.FetcherConfig, bf.LastConfig)
 	if err != nil {
 		return nil, err
 	}

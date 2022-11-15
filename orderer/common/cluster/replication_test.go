@@ -863,12 +863,12 @@ func TestBlockPullerFromConfigBlockFailures(t *testing.T) {
 		},
 		{
 			name:        "invalid block",
-			expectedErr: "block data is nil",
+			expectedErr: "block contains no data",
 			block:       &common.Block{},
 		},
 		{
 			name:        "bad envelope inside block",
-			expectedErr: "failed extracting bundle from envelope: failed to unmarshal payload from envelope: error unmarshalling Payload",
+			expectedErr: "error unmarshalling Payload",
 			block: &common.Block{
 				Data: &common.BlockData{
 					Data: [][]byte{protoutil.MarshalOrPanic(&common.Envelope{
@@ -897,7 +897,7 @@ func TestBlockPullerFromConfigBlockFailures(t *testing.T) {
 	}
 }
 
-func testBlockPullerFromConfig(t *testing.T, blockVerifiers []cluster.BlockVerifier, expectedLogMsg string, iterations int) {
+func testBlockPullerFromConfig(t *testing.T, blockVerifiers []replication.BlockVerifier, expectedLogMsg string, iterations int) {
 	verifierRetriever := &cmocks.VerifierRetriever{}
 	for _, blockVerifier := range blockVerifiers {
 		verifierRetriever.On("RetrieveVerifier", mock.Anything).Return(blockVerifier).Once()
@@ -1044,13 +1044,13 @@ func TestSkipPullingPulledChannels(t *testing.T) {
 func TestBlockPullerFromConfigBlockGreenPath(t *testing.T) {
 	for _, testCase := range []struct {
 		description        string
-		blockVerifiers     []cluster.BlockVerifier
+		blockVerifiers     []replication.BlockVerifier
 		expectedLogMessage string
 		iterations         int
 	}{
 		{
 			description:        "Success",
-			blockVerifiers:     []cluster.BlockVerifier{&cluster.NoopBlockVerifier{}},
+			blockVerifiers:     []replication.BlockVerifier{&cluster.NoopBlockVerifier{}},
 			expectedLogMessage: "Got block [0] of size",
 			iterations:         1,
 		},
@@ -1058,7 +1058,7 @@ func TestBlockPullerFromConfigBlockGreenPath(t *testing.T) {
 			description: "Failure",
 			iterations:  2,
 			// First time it returns nil, second time returns like the success case
-			blockVerifiers: []cluster.BlockVerifier{nil, &cluster.NoopBlockVerifier{}},
+			blockVerifiers: []replication.BlockVerifier{nil, &cluster.NoopBlockVerifier{}},
 			expectedLogMessage: "Failed verifying received blocks: " +
 				"couldn't acquire verifier for channel mychannel",
 		},

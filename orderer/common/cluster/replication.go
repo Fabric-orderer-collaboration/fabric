@@ -17,6 +17,7 @@ import (
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/replication"
+	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
@@ -353,7 +354,7 @@ type PullerConfig struct {
 // VerifierRetriever retrieves BlockVerifiers for channels.
 type VerifierRetriever interface {
 	// RetrieveVerifier retrieves a BlockVerifier for the given channel.
-	RetrieveVerifier(channel string) BlockVerifier
+	RetrieveVerifier(channel string) replication.BlockVerifier
 }
 
 // BlockPullerFromConfigBlock returns a BlockPuller that doesn't verify signatures on blocks.
@@ -362,7 +363,12 @@ func BlockPullerFromConfigBlock(conf PullerConfig, block *common.Block, verifier
 		return nil, errors.New("nil block")
 	}
 
-	endpoints, err := replication.EndpointconfigFromConfigBlock(block, bccsp)
+	bundle, err := replication.BundleFromConfigBlock(block, bccsp)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoints, err := replication.EndpointsFromConfig(bundle)
 	if err != nil {
 		return nil, err
 	}
@@ -387,15 +393,15 @@ func BlockPullerFromConfigBlock(conf PullerConfig, block *common.Block, verifier
 	}
 
 	return &replication.BlockPuller{
-		Logger:  flogging.MustGetLogger("orderer.common.cluster.replication").With("channel", conf.Channel),
-		Dialer:  dialer,
-		TLSCert: tlsCertAsDER.Bytes,
+		Logger:      flogging.MustGetLogger("orderer.common.cluster.replication").With("channel", conf.Channel),
+		Dialer:      dialer,
+		TLSCertHash: util.ComputeSHA256(tlsCertAsDER.Bytes),
 		VerifyBlockSequence: func(blocks []*common.Block, channel string) error {
 			verifier := verifierRetriever.RetrieveVerifier(channel)
 			if verifier == nil {
 				return errors.Errorf("couldn't acquire verifier for channel %s", channel)
 			}
-			return VerifyBlocks(blocks, verifier)
+			return replication.VerifyBlocks(blocks, verifier)
 		},
 		MaxTotalBufferBytes: conf.MaxTotalBufferBytes,
 		Endpoints:           endpoints,
@@ -583,7 +589,7 @@ func (ci *ChainInspector) Channels() []ChannelGenesisBlock {
 	// We don't need to verify the entire chain of all blocks we pulled,
 	// because the block puller calls VerifyBlockHash on all blocks it pulls.
 	last2Blocks := []*common.Block{block, ci.LastConfigBlock}
-	if err := VerifyBlockHash(1, last2Blocks); err != nil {
+	if err := replication.VerifyBlockHash(1, last2Blocks); err != nil {
 		ci.Logger.Panic("System channel pulled doesn't match the boot last config block:", err)
 	}
 

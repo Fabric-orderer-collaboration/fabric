@@ -17,6 +17,7 @@ import (
 	"github.com/hyperledger/fabric/common/deliver/mock"
 	"github.com/hyperledger/fabric/common/ledger/blockledger"
 	"github.com/hyperledger/fabric/common/policies"
+	"github.com/hyperledger/fabric/common/replication"
 	"github.com/hyperledger/fabric/core/config/configtest"
 	"github.com/hyperledger/fabric/internal/configtxgen/encoder"
 	"github.com/hyperledger/fabric/internal/configtxgen/genesisconfig"
@@ -47,7 +48,7 @@ func TestChainSupportBlock(t *testing.T) {
 	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
 	require.NoError(t, err)
 	cs := &ChainSupport{
-		ledgerResources: &ledgerResources{ReadWriter: ledger},
+		LedgerResources: &replication.LedgerResources{ReadWriter: ledger},
 		BCCSP:           cryptoProvider,
 	}
 
@@ -88,14 +89,10 @@ func TestLedgerResources_VerifyBlockSignature(t *testing.T) {
 	}
 	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
 	require.NoError(t, err)
+
 	cs := &ChainSupport{
-		ledgerResources: &ledgerResources{
-			configResources: &configResources{
-				mutableResources: ms,
-				bccsp:            cryptoProvider,
-			},
-		},
-		BCCSP: cryptoProvider,
+		LedgerResources: replication.NewLedgerResources(ms, cryptoProvider, nil),
+		BCCSP:           cryptoProvider,
 	}
 
 	// Scenario I: Policy manager isn't initialized

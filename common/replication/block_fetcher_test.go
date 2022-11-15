@@ -16,6 +16,7 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/replication"
 	"github.com/hyperledger/fabric/common/replication/mocks"
@@ -58,10 +59,10 @@ func TestBlockFetcherHappyPath(t *testing.T) {
 		},
 		TimeNow: time.Now,
 		Logger:  flogging.MustGetLogger("test"),
-		BlockSourceFactory: func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+		BlockSourceFactory: func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 			return mock_block_puller(1, nil, time.Millisecond*1), nil
 		},
-		BlockVerifierFactory: func(block *common.Block) protoutil.BlockVerifierFunc {
+		BlockVerifierFactory: func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 			return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 				// assuming blocks are valid
 				return nil
@@ -95,10 +96,10 @@ func TestBlockFetcherBlockSourceError(t *testing.T) {
 		TimeNow: time.Now,
 		Logger:  flogging.MustGetLogger("test"),
 		// blocksource factory should return error
-		BlockSourceFactory: func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+		BlockSourceFactory: func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 			return mock_block_puller(1, nil, time.Millisecond*1), errors.New("bad config block")
 		},
-		BlockVerifierFactory: func(block *common.Block) protoutil.BlockVerifierFunc {
+		BlockVerifierFactory: func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 			return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 				// assuming blocks are valid
 				return nil
@@ -146,7 +147,7 @@ func TestBlockFetcherShuffleTimeOut(t *testing.T) {
 
 	getNameForSource := nameFactory("node", 3)
 
-	bf.BlockVerifierFactory = func(block *common.Block) protoutil.BlockVerifierFunc {
+	bf.BlockVerifierFactory = func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 			// assuming blocks are valid
 			return nil
@@ -157,7 +158,7 @@ func TestBlockFetcherShuffleTimeOut(t *testing.T) {
 	// the block source created first sends blocks with data: "first"
 	// the block source created seond time sends blocks with data: "second"
 	// test uses this information to detetc whether blocksource has been shuffled while pulling blocks
-	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 		// by default block fetcher will pull from Endpoint index 1 (not 0) for the first time
 		// i.e localhost:5200
 		bf.Logger.Infof("Block source get input %v", c.Endpoints)
@@ -205,7 +206,7 @@ func TestBlockFetcherShuffleTimeOutDisable(t *testing.T) {
 
 	getNameForSource := nameFactory("node", 3)
 
-	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 		if c.Endpoints[0].Endpoint == "localhost:5100" {
 			data := [][]byte{[]byte(getNameForSource())}
 			return mock_block_puller(1, data, time.Millisecond*12), nil
@@ -215,7 +216,7 @@ func TestBlockFetcherShuffleTimeOutDisable(t *testing.T) {
 		}
 	}
 
-	bf.BlockVerifierFactory = func(block *common.Block) protoutil.BlockVerifierFunc {
+	bf.BlockVerifierFactory = func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 			// assuming blocks are valid
 			return nil
@@ -260,7 +261,7 @@ func TestBlockFetcherNodeOffline(t *testing.T) {
 
 	getNameForSource := nameFactory("node", 3)
 
-	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 		node_name := getNameForSource()
 		if node_name == "node1" {
 			return mock_block_puller_returns_nil(time.Millisecond * 2), nil
@@ -269,7 +270,7 @@ func TestBlockFetcherNodeOffline(t *testing.T) {
 		}
 	}
 
-	bf.BlockVerifierFactory = func(block *common.Block) protoutil.BlockVerifierFunc {
+	bf.BlockVerifierFactory = func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 			// assuming blocks are valid
 			return nil
@@ -278,7 +279,7 @@ func TestBlockFetcherNodeOffline(t *testing.T) {
 
 	bf.VerifyBlock = bf.BlockVerifierFactory(nil)
 
-	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.AttestationSource, error) {
+	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.AttestationSource, error) {
 		// attestation source created withhold attestation
 		return mock_attestation_puller(1, time.Millisecond*1), nil
 	}
@@ -352,7 +353,7 @@ func TestBlockFetcherBFTBehaviorBlockWithhold(t *testing.T) {
 
 	getNameForSource := nameFactory("node", 10)
 
-	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 		// node1 witholds block while other endpoints can deliver blocks
 		node_name := getNameForSource()
 		if node_name == "node1" {
@@ -366,7 +367,7 @@ func TestBlockFetcherBFTBehaviorBlockWithhold(t *testing.T) {
 
 	attestation_source_created := false
 	lock := sync.Mutex{}
-	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.AttestationSource, error) {
+	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.AttestationSource, error) {
 		lock.Lock()
 		defer lock.Unlock()
 		if !attestation_source_created {
@@ -391,7 +392,7 @@ func TestBlockFetcherBFTBehaviorBlockWithhold(t *testing.T) {
 	bf.FetcherConfig.Endpoints = []replication.EndpointCriteria{
 		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
 	}
-	bf.BlockVerifierFactory = func(block *common.Block) protoutil.BlockVerifierFunc {
+	bf.BlockVerifierFactory = func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 			// assuming blocks are valid
 			return nil
@@ -416,7 +417,7 @@ func TestBlockFetcherAttestationSourceError(t *testing.T) {
 
 	getNameForSource := nameFactory("node", 10)
 
-	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 		// node1 witholds block while other endpoints can deliver blocks
 		node_name := getNameForSource()
 		if node_name == "node1" {
@@ -430,7 +431,7 @@ func TestBlockFetcherAttestationSourceError(t *testing.T) {
 
 	attestation_source_created := false
 	lock := sync.Mutex{}
-	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.AttestationSource, error) {
+	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.AttestationSource, error) {
 		lock.Lock()
 		defer lock.Unlock()
 		if !attestation_source_created {
@@ -455,7 +456,7 @@ func TestBlockFetcherAttestationSourceError(t *testing.T) {
 	bf.FetcherConfig.Endpoints = []replication.EndpointCriteria{
 		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
 	}
-	bf.BlockVerifierFactory = func(block *common.Block) protoutil.BlockVerifierFunc {
+	bf.BlockVerifierFactory = func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 			// assuming blocks are valid
 			return nil
@@ -488,7 +489,7 @@ func TestBlockFetcherBFTBehaviorSuspicionNoBlockWithhold(t *testing.T) {
 
 	getNameForSource := nameFactory("node", 10)
 
-	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 		// node1 witholds block while other endpoints can deliver blocks.
 
 		node_name := getNameForSource()
@@ -501,7 +502,7 @@ func TestBlockFetcherBFTBehaviorSuspicionNoBlockWithhold(t *testing.T) {
 		return mock_block_puller(1, data, time.Millisecond*2), nil
 	}
 
-	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.AttestationSource, error) {
+	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.AttestationSource, error) {
 		// attestation source created withhold attestation
 		return mock_attestation_puller_returns_nil(nil, time.Second*1), nil
 	}
@@ -530,7 +531,7 @@ func TestBlockFetcherBFTBehaviorSuspicionNoBlockWithhold(t *testing.T) {
 		{Endpoint: "localhost:5103"},
 	}
 
-	bf.BlockVerifierFactory = func(block *common.Block) protoutil.BlockVerifierFunc {
+	bf.BlockVerifierFactory = func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 			// assuming blocks are valid
 			return nil
@@ -577,7 +578,7 @@ func TestBlockFetcherBFTBehaviorSuspicionListFull(t *testing.T) {
 	}
 
 	firstTime := true
-	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 		// node1 and node 2 withold block while other endpoints can deliver blocks
 		node_name := getNameForSource()
 		if (node_name == "node1" && firstTime) || node_name == "node2" {
@@ -593,7 +594,7 @@ func TestBlockFetcherBFTBehaviorSuspicionListFull(t *testing.T) {
 	var lock sync.Mutex
 	firstAttestationSource := true
 
-	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.AttestationSource, error) {
+	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.AttestationSource, error) {
 		lock.Lock()
 		defer lock.Unlock()
 		if !firstAttestationSource {
@@ -625,7 +626,7 @@ func TestBlockFetcherBFTBehaviorSuspicionListFull(t *testing.T) {
 	}
 
 	// simulate byzantine behaviour
-	bf.BlockVerifierFactory = func(block *common.Block) protoutil.BlockVerifierFunc {
+	bf.BlockVerifierFactory = func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 			// assuming blocks are valid
 			return nil
@@ -658,7 +659,7 @@ func TestBlockFetcherBFTBehaviorPullAttestationError(t *testing.T) {
 		return name
 	}
 
-	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 		// node1 witholds block while other endpoints can deliver blocks
 		node_name := getNameForSource()
 		if node_name == "node1" {
@@ -672,7 +673,7 @@ func TestBlockFetcherBFTBehaviorPullAttestationError(t *testing.T) {
 
 	attestation_source_created := false
 	lock := sync.Mutex{}
-	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.AttestationSource, error) {
+	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.AttestationSource, error) {
 		lock.Lock()
 		defer lock.Unlock()
 		if !attestation_source_created {
@@ -716,7 +717,7 @@ func TestBlockFetcherBFTBehaviorPullAttestationError(t *testing.T) {
 		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
 	}
 
-	bf.BlockVerifierFactory = func(block *common.Block) protoutil.BlockVerifierFunc {
+	bf.BlockVerifierFactory = func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 			// assuming blocks are valid
 			return nil
@@ -770,7 +771,7 @@ func TestBlockFetcherMaxRetriesExhausted(t *testing.T) {
 		return name
 	}
 
-	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 		// by default block fetcher will pull from Endpoint index 1 (not 0) for the first time
 		// i.e localhost:5200
 		node_name := getNameForSource()
@@ -783,7 +784,7 @@ func TestBlockFetcherMaxRetriesExhausted(t *testing.T) {
 		}
 	}
 
-	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.AttestationSource, error) {
+	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.AttestationSource, error) {
 		if c.Endpoints[0].Endpoint == "localhost:5100" || c.Endpoints[0].Endpoint == "localhost:5101" || c.Endpoints[0].Endpoint == "localhost:5102" || c.Endpoints[0].Endpoint == "localhost:5103" {
 			// withhold block
 			return mock_attestation_puller_returns_nil(nil, time.Millisecond*12), nil
@@ -793,7 +794,7 @@ func TestBlockFetcherMaxRetriesExhausted(t *testing.T) {
 		return mock_attestation_puller(1, time.Second*2), nil
 	}
 
-	bf.BlockVerifierFactory = func(block *common.Block) protoutil.BlockVerifierFunc {
+	bf.BlockVerifierFactory = func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 			// assuming blocks are invalid
 			return errors.New("some error")
@@ -820,7 +821,7 @@ func TestBlockFetcherInitVerifierFromGenesisBlock(t *testing.T) {
 	// send block with seq number 1. `latestConfigBlock` is used as a selector to select above type of
 	// blocksources. If `latestConfigBlock` is nil, this BlockSourceFactory creates a genesisblock source
 	// if latestConfigBlock is not nil, it creates block source which sends block seq 1
-	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
+	bf.BlockSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.BlockSource, error) {
 		bs := &mocks.BlockSource{}
 		blockCreator := func(selector bool) *common.Block {
 			if selector {
@@ -832,13 +833,13 @@ func TestBlockFetcherInitVerifierFromGenesisBlock(t *testing.T) {
 				Metadata: &common.BlockMetadata{},
 			}
 		}
-		bs.On("PullBlock", mock.Anything).Return(blockCreator(latestConfigBlock == nil)).After(1 * time.Second)
+		bs.On("PullBlock", mock.Anything).Return(blockCreator(latestConfig == nil)).After(1 * time.Second)
 		bs.On("UpdateEndpoints", mock.Anything)
 		bs.On("Close", mock.Anything)
 		return bs, nil
 	}
 
-	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.AttestationSource, error) {
+	bf.AttestationSourceFactory = func(c replication.FetcherConfig, latestConfig channelconfig.Resources) (replication.AttestationSource, error) {
 		// all attestation pullers send attestation blocks
 		return mock_attestation_puller(1, time.Second*2), nil
 	}
@@ -860,7 +861,7 @@ func TestBlockFetcherInitVerifierFromGenesisBlock(t *testing.T) {
 		{Endpoint: "localhost:5100"}, {Endpoint: "localhost:5101"}, {Endpoint: "localhost:5102"}, {Endpoint: "localhost:5103"}, {Endpoint: "localhost:5104"}, {Endpoint: "localhost:5105"}, {Endpoint: "localhost:5106"}, {Endpoint: "localhost:5107"}, {Endpoint: "localhost:5108"},
 	}
 
-	bf.BlockVerifierFactory = func(block *common.Block) protoutil.BlockVerifierFunc {
+	bf.BlockVerifierFactory = func(config channelconfig.Resources) protoutil.BlockVerifierFunc {
 		return func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
 			// assuming blocks are valid
 			return nil
@@ -869,15 +870,15 @@ func TestBlockFetcherInitVerifierFromGenesisBlock(t *testing.T) {
 
 	// Since `VerifyBlock=nil`, BlockFetcher should try to pull Genesis block
 	bf.VerifyBlock = nil
-	bf.LastConfigBlock = nil
+	bf.LastConfig = nil
 
 	block := bf.PullBlock(1)
 	// VerifyBlock should not be nil
 	require.Equal(t, false, bf.VerifyBlock == nil)
 	// LastConfigBlock should not be nil
-	require.NotEqual(t, nil, bf.LastConfigBlock)
+	require.NotEqual(t, nil, bf.LastConfig)
 	// LastConfigBlock should be genesisBlock
-	require.Equal(t, uint64(0), bf.LastConfigBlock.Header.Number)
+	require.Equal(t, uint64(0), bf.ConfigSequence)
 	// PullBlock should have pulled block number 1
 	require.Equal(t, uint64(1), block.Header.Number)
 }
@@ -958,7 +959,7 @@ func newAttestationPuller(dialer *countingDialer, orderers ...string) *replicati
 		Logger: flogging.MustGetLogger("test"),
 		Config: replication.FetcherConfig{
 			Channel:      "mychannel",
-			TLSCert:      []byte{},
+			TLSCertHash:  []byte{},
 			Endpoints:    endpointCriteriaFromEndpoints(orderers...),
 			FetchTimeout: time.Second * 10,
 		},

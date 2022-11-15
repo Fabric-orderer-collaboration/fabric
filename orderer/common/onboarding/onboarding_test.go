@@ -28,6 +28,7 @@ import (
 	deliver_mocks "github.com/hyperledger/fabric/common/deliver/mock"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/ledger/blockledger"
+	"github.com/hyperledger/fabric/common/replication"
 	"github.com/hyperledger/fabric/core/config/configtest"
 	"github.com/hyperledger/fabric/internal/configtxgen/encoder"
 	"github.com/hyperledger/fabric/internal/configtxgen/genesisconfig"
@@ -986,7 +987,7 @@ func TestVerifierLoader(t *testing.T) {
 		ledgerHeight              uint64
 		lastBlock                 *common.Block
 		lastConfigBlock           *common.Block
-		verifierFromConfigReturns cluster.BlockVerifier
+		verifierFromConfigReturns replication.BlockVerifier
 		verifierFromConfigErr     error
 		onFailureInvoked          bool
 		expectedPanic             string

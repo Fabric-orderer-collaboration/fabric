@@ -14,10 +14,9 @@ import (
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/replication"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
-	"github.com/hyperledger/fabric/orderer/common/cluster"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
-	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 )
 
@@ -51,17 +50,16 @@ type ChannelPuller interface {
 type BlockPullerCreator struct {
 	channelID               string
 	bccsp                   bccsp.BCCSP
-	blockSigVerifierFactory cluster.VerifierFactory // Creates a new block signature verifier
-	blockSigVerifier        cluster.BlockVerifier   // The current block signature verifier, from the latest channel config
+	blockSigVerifierFactory replication.VerifierFactory // Creates a new block signature verifier
+	blockSigVerifier        replication.BlockVerifier   // The current block signature verifier, from the latest channel config
 	clusterConfig           localconfig.Cluster
 	signer                  identity.SignerSerializer
-	der                     *pem.Block
-	stdDialer               *replication.StandardDialer
+	dialerConfig            comm.ClientConfig
 	ClusterVerifyBlocks     ClusterVerifyBlocksFunc // Default: cluster.VerifyBlocks, or a mock for testing
 }
 
-// ClusterVerifyBlocksFunc is a function that matches the signature of cluster.VerifyBlocks, and allows mocks for testing.
-type ClusterVerifyBlocksFunc func(blockBuff []*common.Block, signatureVerifier cluster.BlockVerifier) error
+// ClusterVerifyBlocksFunc is a function that matches the signature of replication.VerifyBlocks, and allows mocks for testing.
+type ClusterVerifyBlocksFunc func(blockBuff []*common.Block, signatureVerifier replication.BlockVerifier) error
 
 // NewBlockPullerCreator creates a new BlockPullerCreator, using the configuration details that do not change during
 // the life cycle of the orderer.
@@ -69,170 +67,56 @@ func NewBlockPullerCreator(
 	channelID string,
 	logger *flogging.FabricLogger,
 	signer identity.SignerSerializer,
-	baseDialer *cluster.PredicateDialer,
+	dialerConfig comm.ClientConfig,
 	clusterConfig localconfig.Cluster,
 	bccsp bccsp.BCCSP,
 ) (*BlockPullerCreator, error) {
-	stdDialer := &replication.StandardDialer{
-		Config: baseDialer.Config,
-	}
-	stdDialer.Config.AsyncConnect = false
-	stdDialer.Config.SecOpts.VerifyCertificate = nil
-
-	der, _ := pem.Decode(stdDialer.Config.SecOpts.Certificate)
+	der, _ := pem.Decode(dialerConfig.SecOpts.Certificate)
 	if der == nil {
 		return nil, errors.Errorf("client certificate isn't in PEM format: %v",
-			string(stdDialer.Config.SecOpts.Certificate))
+			string(dialerConfig.SecOpts.Certificate))
 	}
 
 	factory := &BlockPullerCreator{
 		channelID: channelID,
 		bccsp:     bccsp,
-		blockSigVerifierFactory: &cluster.BlockVerifierAssembler{
+		blockSigVerifierFactory: &replication.BlockVerifierAssembler{
 			Logger: logger,
 			BCCSP:  bccsp,
 		},
 		clusterConfig:       clusterConfig,
 		signer:              signer,
-		stdDialer:           stdDialer,
-		der:                 der,
-		ClusterVerifyBlocks: cluster.VerifyBlocks, // The default block sequence verification method.
+		dialerConfig:        dialerConfig,
+		ClusterVerifyBlocks: replication.VerifyBlocks, // The default block sequence verification method.
 	}
 
 	return factory, nil
 }
 
-// BlockPuller creates a block puller on demand, taking the endpoints from the config block.
-func (creator *BlockPullerCreator) BlockPuller_(configBlock *common.Block, stopChannel chan struct{}) (ChannelPuller, error) {
-	// Extract the TLS CA certs and endpoints from the join-block
-	endpoints, err := replication.EndpointconfigFromConfigBlock(configBlock, creator.bccsp)
-	if err != nil {
-		return nil, errors.WithMessage(err, "error extracting endpoints from config block")
-	}
-
-	bp := &replication.BlockPuller{
-		VerifyBlockSequence: creator.VerifyBlockSequence,
-		Logger:              flogging.MustGetLogger("orderer.common.cluster.puller").With("channel", creator.channelID),
-		RetryTimeout:        creator.clusterConfig.ReplicationRetryTimeout,
-		MaxTotalBufferBytes: creator.clusterConfig.ReplicationBufferSize,
-		MaxPullBlockRetries: uint64(creator.clusterConfig.ReplicationMaxRetries),
-		FetchTimeout:        creator.clusterConfig.ReplicationPullTimeout,
-		Endpoints:           endpoints,
-		Signer:              creator.signer,
-		TLSCert:             creator.der.Bytes,
-		Channel:             creator.channelID,
-		Dialer:              creator.stdDialer,
-		StopChannel:         stopChannel,
-	}
-
-	return bp, nil
-}
-
 // BlockFetcher creates a block fetcher on demand, taking the endpoints from the config block.
 func (creator *BlockPullerCreator) BlockPuller(configBlock *common.Block, stopChannel chan struct{}) (ChannelPuller, error) {
-	// Extract the TLS CA certs and endpoints from the join-block
-	endpoints, err := replication.EndpointconfigFromConfigBlock(configBlock, creator.bccsp)
-	if err != nil {
-		return nil, errors.WithMessage(err, "error extracting endpoints from config block")
-	}
-
 	fc := replication.FetcherConfig{
 		Channel:                      creator.channelID,
-		TLSCert:                      creator.der.Bytes,
-		Endpoints:                    endpoints,
 		FetchTimeout:                 creator.clusterConfig.ReplicationPullTimeout,
+		RetryTimeout:                 creator.clusterConfig.ReplicationRetryTimeout,
 		CensorshipSuspicionThreshold: time.Duration((int64(creator.clusterConfig.ReplicationPullTimeout) * shuffleTimeoutPercentage / 100)),
 		PeriodicalShuffleInterval:    shuffleTimeoutMultiplier * creator.clusterConfig.ReplicationPullTimeout,
 		MaxRetries:                   uint64(creator.clusterConfig.ReplicationMaxRetries),
+		BufferSize:                   creator.clusterConfig.ReplicationBufferSize,
 	}
 
-	bf_logger := flogging.MustGetLogger("orderer.common.cluster.puller").With("channel", creator.channelID)
-
-	// modify the verifier builder with middleware to skip verifying the genesis block
-	// in the follower chain
-	modifiedVerifierBuilder := func(blockVerifierFunction protoutil.BlockVerifierFunc) protoutil.BlockVerifierFunc {
-		return protoutil.BlockVerifierFunc(
-			func(header *common.BlockHeader, metadata *common.BlockMetadata) error {
-				// don't verify the genesis block
-				if header.Number == 0 {
-					bf_logger.Debugf("Not verfying genesis block for follower chain")
-					return nil
-				}
-
-				return blockVerifierFunction(header, metadata)
-			})
-	}
-
-	// wrap the verifier factory to stop verifying genesis block
-	verifierFactory := func(block *common.Block) protoutil.BlockVerifierFunc {
-		vf := cluster.BlockVerifierBuilder(creator.bccsp)
-		return modifiedVerifierBuilder(vf(block))
-	}
-
-	// To tolerate byzantine behaviour of `f` faulty nodes, we need atleast of `3f + 1` nodes.
-	// check for bft enable and update `MaxByzantineNodes`
-	// accordingly.
-	bftEnabled, f, err := replication.BFTEnabledInConfig(configBlock, creator.bccsp)
+	bundle, err := replication.BundleFromConfigBlock(configBlock, creator.bccsp)
 	if err != nil {
 		return nil, err
 	}
 
-	var verifyBlockFunc protoutil.BlockVerifierFunc
-	if bftEnabled && f > 0 {
-		fc.MaxByzantineNodes = f
-		// setting verifyBlockFunc, will make BlockFetcher pull genesis block in a bft setting and
-		// intialize the VerifyBlock function
-		verifyBlockFunc = nil
-	} else {
-		verifyBlockFunc = verifierFactory(configBlock)
-	}
-
-	bf := &replication.BlockFetcher{
-		FetcherConfig:        fc,
-		LastConfigBlock:      configBlock,
-		BlockVerifierFactory: verifierFactory,
-		VerifyBlock:          verifyBlockFunc,
-		AttestationSourceFactory: func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.AttestationSource, error) {
-			fc, err := replication.UpdateFetcherConfigFromConfigBlock(c, latestConfigBlock)
-			bf_logger.Errorf("Could not update FetcherConfig fom Config Block: %v", err)
-			return &replication.AttestationPuller{
-				Logger: flogging.MustGetLogger("orderer.common.cluster.attestationpuller").With("channel", creator.channelID),
-				Signer: creator.signer,
-				Dialer: creator.stdDialer,
-				Config: fc,
-			}, err
-		},
-		BlockSourceFactory: func(c replication.FetcherConfig, latestConfigBlock *common.Block) (replication.BlockSource, error) {
-			fc, err := replication.UpdateFetcherConfigFromConfigBlock(c, latestConfigBlock)
-			bf_logger.Errorf("Could not update FetcherConfig from Config Block: %v", err)
-			return &replication.BlockPuller{
-				MaxPullBlockRetries: uint64(creator.clusterConfig.ReplicationMaxRetries),
-				MaxTotalBufferBytes: creator.clusterConfig.ReplicationBufferSize,
-				Signer:              creator.signer,
-				TLSCert:             creator.der.Bytes,
-				Channel:             fc.Channel,
-				FetchTimeout:        creator.clusterConfig.ReplicationPullTimeout,
-				RetryTimeout:        creator.clusterConfig.ReplicationRetryTimeout,
-				Logger:              flogging.MustGetLogger("orderer.common.cluster.puller").With("channel", fc.Channel),
-				Dialer:              creator.stdDialer,
-				VerifyBlockSequence: creator.VerifyBlockSequence,
-				Endpoints:           fc.Endpoints,
-				StopChannel:         stopChannel,
-			}, err
-		},
-		Logger:  bf_logger,
-		TimeNow: time.Now,
-		Signer:  creator.signer,
-		Dialer:  creator.stdDialer,
-	}
-
-	return bf, nil
+	return replication.NewBlockFetcher(fc, creator.signer, creator.bccsp, bundle, creator.dialerConfig, creator.VerifyBlockSequence, stopChannel)
 }
 
 // UpdateVerifierFromConfigBlock creates a new block signature verifier from the config block and updates the internal
 // link to said verifier.
 func (creator *BlockPullerCreator) UpdateVerifierFromConfigBlock(configBlock *common.Block) error {
-	configEnv, err := cluster.ConfigFromBlock(configBlock)
+	configEnv, err := replication.ConfigFromBlock(configBlock)
 	if err != nil {
 		return errors.WithMessage(err, "failed to extract config envelope from block")
 	}
@@ -257,7 +141,7 @@ func (creator *BlockPullerCreator) VerifyBlockSequence(blocks []*common.Block, _
 		return errors.New("first block header is nil")
 	}
 	if blocks[0].Header.Number == 0 {
-		configEnv, err := cluster.ConfigFromBlock(blocks[0])
+		configEnv, err := replication.ConfigFromBlock(blocks[0])
 		if err != nil {
 			return errors.WithMessage(err, "failed to extract config envelope from genesis block")
 		}
